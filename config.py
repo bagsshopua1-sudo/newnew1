@@ -56,6 +56,12 @@ class Config:
 
     order_fill_timeout_sec: float = field(default_factory=lambda: _f("ORDER_FILL_TIMEOUT_SEC", 8))
     max_reprice_attempts: int = field(default_factory=lambda: _i("MAX_REPRICE_ATTEMPTS", 3))
+    # lighter.PaperClient не умеет держать "висящую" лимитку в очереди - IOC либо
+    # исполняется сразу против противоположной стороны стакана, либо отменяется
+    # целиком. Чтобы paper-режим вообще мог исполнять сделки, вход ставится с
+    # небольшим пересечением спреда (в % от цены) - это НЕ используется в live,
+    # там ордер честно висит в стакане post-only.
+    paper_cross_buffer_pct: float = field(default_factory=lambda: _f("PAPER_CROSS_BUFFER_PCT", 0.05))
 
     # Веб-дашборд. Render и другие облачные платформы сами прокидывают порт через PORT -
     # если он задан, он в приоритете над DASHBOARD_PORT.
