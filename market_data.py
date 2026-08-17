@@ -43,6 +43,59 @@ class BookSnapshot:
     ts: float = field(default_factory=time.time)
 
 
+def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tuple],
+                  wall_min_usd: float, wall_max_distance_pct: float) -> Optional[BookSnapshot]:
+    """
+    Общий анализ стакана (стенки + дисбаланс) - не привязан к конкретной бирже.
+    bids/asks - списки (price: float, size: float), в любом порядке (сортируем сами).
+    Используется и для стакана Lighter (исполнение), и для стакана Binance (сигнал).
+    """
+    if not bids or not asks:
+        return None
+    bids = sorted(bids, key=lambda x: -x[0])
+    asks = sorted(asks, key=lambda x: x[0])
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid = (best_bid + best_ask) / 2
+    if mid <= 0:
+        return None
+
+    max_dist = wall_max_distance_pct / 100.0
+
+    def find_walls(levels, side):
+        walls = []
+        for price, size in levels:
+            usd = price * size
+            dist = abs(price - mid) / mid
+            if usd >= wall_min_usd and dist <= max_dist:
+                walls.append(Wall(price=price, size=size, usd=usd, side=side, distance_pct=dist * 100))
+        return walls
+
+    bid_walls = find_walls(bids, "bid")
+    ask_walls = find_walls(asks, "ask")
+
+    near_bids = [price * size for price, size in bids if abs(price - mid) / mid <= max_dist]
+    near_asks = [price * size for price, size in asks if abs(price - mid) / mid <= max_dist]
+    bid_vol = sum(near_bids)
+    ask_vol = sum(near_asks)
+    total = bid_vol + ask_vol
+    imbalance = (bid_vol / total) if total > 0 else 0.5
+
+    return BookSnapshot(
+        market_id=str(market_id),
+        symbol=symbol,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        mid=mid,
+        bid_walls=bid_walls,
+        ask_walls=ask_walls,
+        bid_volume_near=bid_vol,
+        ask_volume_near=ask_vol,
+        imbalance=imbalance,
+    )
+
+
 class MarketData:
     def __init__(self, exchange, markets: Dict[str, MarketInfo], on_prolonged_outage=None):
         self.exchange = exchange
@@ -71,53 +124,10 @@ class MarketData:
                 pass
 
     def _analyze(self, market: MarketInfo, book: dict) -> Optional[BookSnapshot]:
-        bids = sorted(book.get("bids", []), key=lambda o: -float(o["price"]))
-        asks = sorted(book.get("asks", []), key=lambda o: float(o["price"]))
-        if not bids or not asks:
-            return None
-
-        best_bid = float(bids[0]["price"])
-        best_ask = float(asks[0]["price"])
-        mid = (best_bid + best_ask) / 2
-
-        max_dist = CFG.wall_max_distance_pct / 100.0
-
-        def find_walls(levels, side):
-            walls = []
-            for lvl in levels:
-                price = float(lvl["price"])
-                size = float(lvl["size"])
-                usd = price * size
-                dist = abs(price - mid) / mid
-                if usd >= CFG.wall_min_usd and dist <= max_dist:
-                    walls.append(Wall(price=price, size=size, usd=usd, side=side, distance_pct=dist * 100))
-            return walls
-
-        bid_walls = find_walls(bids, "bid")
-        ask_walls = find_walls(asks, "ask")
-
-        # объём вблизи мида (в пределах той же дистанции) для расчёта дисбаланса
-        near_bids = [float(o["size"]) * float(o["price"]) for o in bids
-                     if abs(float(o["price"]) - mid) / mid <= max_dist]
-        near_asks = [float(o["size"]) * float(o["price"]) for o in asks
-                     if abs(float(o["price"]) - mid) / mid <= max_dist]
-        bid_vol = sum(near_bids)
-        ask_vol = sum(near_asks)
-        total = bid_vol + ask_vol
-        imbalance = (bid_vol / total) if total > 0 else 0.5
-
-        return BookSnapshot(
-            market_id=str(market.market_index),
-            symbol=market.symbol,
-            best_bid=best_bid,
-            best_ask=best_ask,
-            mid=mid,
-            bid_walls=bid_walls,
-            ask_walls=ask_walls,
-            bid_volume_near=bid_vol,
-            ask_volume_near=ask_vol,
-            imbalance=imbalance,
-        )
+        bids = [(float(o["price"]), float(o["size"])) for o in book.get("bids", [])]
+        asks = [(float(o["price"]), float(o["size"])) for o in book.get("asks", [])]
+        return analyze_book(market.symbol, str(market.market_index), bids, asks,
+                             CFG.wall_min_usd, CFG.wall_max_distance_pct)
 
     # ------------------------------------------------------------------ #
 
