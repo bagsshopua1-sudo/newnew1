@@ -48,6 +48,10 @@ class ManagedPosition:
     current_sl_price: float = 0.0
     opened_at: float = field(default_factory=time.time)
     trade_id: Optional[int] = None
+    # Тезис сделки (для "умного" выхода по развалу структуры) - см. _thesis_invalidated
+    signal_type: str = ""
+    reference_price: float = 0.0
+    realized_pnl: float = 0.0  # накапливается по частичным закрытиям (TP1 + финал)
 
 
 class OrderManager:
@@ -60,7 +64,8 @@ class OrderManager:
         self.kill_switch = kill_switch
         self.positions: Dict[str, ManagedPosition] = {}  # symbol -> position
         self._watchers: Dict[str, asyncio.Task] = {}
-        self._latest_snap: Dict[str, "BookSnapshot"] = {}
+        self._latest_snap: Dict[str, "BookSnapshot"] = {}  # стакан Lighter - цена исполнения
+        self._latest_signal_snap: Dict[str, "BookSnapshot"] = {}  # стакан-источник сигнала (Binance) - структура
         # Символы, для которых прямо сейчас идёт попытка входа (между сигналом и
         # регистрацией позиции есть await, поэтому has_position() одна не спасает
         # от гонки, если за это время прилетит ещё один сигнал по тому же символу).
@@ -68,6 +73,9 @@ class OrderManager:
 
     def note_snapshot(self, snap):
         self._latest_snap[snap.symbol] = snap
+
+    def note_signal_snapshot(self, snap):
+        self._latest_signal_snap[snap.symbol] = snap
 
     def has_position(self, symbol: str) -> bool:
         return symbol in self.positions
@@ -85,7 +93,8 @@ class OrderManager:
         if not self.risk.can_trade():
             return
 
-        plan = self.risk.build_plan(signal.symbol, signal.side, signal.mid)
+        plan = self.risk.build_plan(signal.symbol, signal.side, signal.mid,
+                                     wall_price=signal.reference_price)
         if plan.size <= 0 or plan.size < market.min_base_amount:
             log.warning("[%s] расчётный размер позиции %.6f меньше минимального лота, сигнал пропущен",
                         signal.symbol, plan.size)
@@ -105,6 +114,7 @@ class OrderManager:
             pos = ManagedPosition(
                 symbol=signal.symbol, side=plan.side, market=market, plan=plan,
                 filled_size=filled_size, avg_entry=avg_entry, current_sl_price=plan.stop_price,
+                signal_type=signal.signal_type, reference_price=signal.reference_price,
             )
             self.positions[signal.symbol] = pos
             if self.trade_log:
@@ -154,7 +164,14 @@ class OrderManager:
                     weighted_price_sum += filled * avg
                     total_filled += filled
                     remaining -= filled
-                if remaining <= 1e-9:
+                # Остаток может быть настолько мал, что после округления до
+                # size_decimals рынка превращается в 0 - PaperClient.validate_order
+                # тогда падает с ValueError("base amount must be positive, got 0.0").
+                # Такой "пыльный" хвост считаем полностью исполненным, а не гоняемся
+                # за ним ещё одной попыткой.
+                tick = 10 ** (-market.size_decimals)
+                if remaining <= 1e-9 or round(remaining, market.size_decimals) < tick:
+                    remaining = 0.0
                     break
                 await asyncio.sleep(1)  # даём стакану обновиться перед следующей попыткой
                 continue
@@ -202,45 +219,96 @@ class OrderManager:
 
     async def _watch_position(self, pos: ManagedPosition):
         """
-        Периодически сверяет позицию с биржей: если размер уменьшился -> сработал
-        SL или TP1 -> реагируем (пересчитываем PnL, включаем трейлинг остатка).
-        Если позиция обнулилась -> сделка закрыта, регистрируем результат в risk.
+        Следит за открытой позицией и решает, когда её закрывать - тремя путями:
+          - цена дошла до стопа (защита от убытка, дистанция посчитана от структуры
+            сигнала в risk.build_plan, не фиксированный %);
+          - цена дошла до TP1 (фиксируем часть, risk:reward от той же стоп-дистанции)
+            -> остаток переводим на трейлинг, чтобы прибыль могла расти дальше;
+          - "умный" выход: сама причина входа перестала быть верной (стенка, от
+            которой фейдили, снята и цена уже прошла её; пробой не удержался;
+            дисбаланс резко развернулся против позиции) - закрываем ДО того, как
+            цена вообще дойдёт до стопа, вместо того чтобы ждать его вслепую.
+        В live-режиме на бирже дополнительно висят нативные reduce-only SL/TP
+        (см. _place_protective_orders) как резервная защита на случай обрыва
+        связи с ботом - эта функция не полагается только на них.
         """
         try:
             while True:
-                await asyncio.sleep(3)
-                live_pos = await self.exchange.get_position(pos.market)
-                current_size = abs(live_pos["size"]) if live_pos else 0.0
+                await asyncio.sleep(CFG.position_check_interval_sec)
+                snap = self._latest_snap.get(pos.symbol)  # цена исполнения (Lighter)
+                if snap is None:
+                    continue
+                price = snap.mid
 
-                if current_size <= 1e-9:
-                    pnl, exit_price = self._estimate_closed_pnl(pos)
-                    self.risk.register_close(pos.symbol, pos.side, pnl)
-                    reason = "tp1+trailing_stop" if pos.tp1_done else "stop_loss"
-                    if self.trade_log and pos.trade_id is not None:
-                        self.trade_log.close_trade(pos.trade_id, exit_price, pnl, reason)
-                    self.positions.pop(pos.symbol, None)
-                    log.info("[%s] позиция полностью закрыта (%s).", pos.symbol, reason)
+                hit_stop = (price <= pos.current_sl_price) if pos.side == "long" else (price >= pos.current_sl_price)
+                if hit_stop:
+                    await self._close_position_now(pos, snap, "stop_loss")
                     return
 
-                if not pos.tp1_done and current_size <= pos.filled_size - pos.plan.tp1_size + 1e-9:
-                    pos.tp1_done = True
-                    pos.trailing_active = True
-                    snap = self._latest_snap.get(pos.symbol)
-                    pos.trailing_extreme = snap.mid if snap else pos.avg_entry
-                    log.info("[%s] TP1 сработал, остаток %.6f переведён на трейлинг-стоп %.2f%%",
-                              pos.symbol, current_size, pos.plan.trailing_stop_pct)
+                if not pos.tp1_done:
+                    hit_tp1 = (price >= pos.plan.tp1_price) if pos.side == "long" else (price <= pos.plan.tp1_price)
+                    if hit_tp1:
+                        await self._partial_close(pos, snap, pos.plan.tp1_size, "tp1")
+                        pos.tp1_done = True
+                        pos.trailing_active = True
+                        pos.trailing_extreme = price
+                        log.info("[%s] TP1 сработал, остаток переведён на трейлинг-стоп %.2f%%",
+                                  pos.symbol, pos.plan.trailing_stop_pct)
 
                 if pos.trailing_active:
-                    await self._update_trailing_stop(pos, current_size)
+                    await self._update_trailing_stop(pos, price)
+
+                # структура сигнала оцениваем по тому же стакану, откуда пришёл
+                # сигнал (Binance, если включён - там реальные стенки/дисбаланс)
+                signal_snap = self._latest_signal_snap.get(pos.symbol) or snap
+                if time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and \
+                        self._thesis_invalidated(pos, signal_snap):
+                    await self._close_position_now(pos, snap, "structure_invalidated")
+                    return
 
         except asyncio.CancelledError:
             return
 
-    async def _update_trailing_stop(self, pos: ManagedPosition, current_size: float):
-        snap = self._latest_snap.get(pos.symbol)
-        if not snap:
-            return
-        price = snap.mid
+    def _thesis_invalidated(self, pos: ManagedPosition, snap) -> bool:
+        """
+        "Умный" выход: проверяет, жива ли ещё сама причина, по которой вошли в
+        сделку - а не только цена относительно стопа/тейка.
+        """
+        if snap is None or not pos.reference_price:
+            return False
+
+        if pos.signal_type == "absorption":
+            # Тезис: стенка держится и её ещё не пробили. Инвалидация - стенка
+            # исчезла с той стороны, от которой фейдили, И цена уже прошла её
+            # уровень (не просто пропала из выдачи на секунду).
+            wall_side = "bid" if pos.side == "long" else "ask"
+            walls = snap.bid_walls if wall_side == "bid" else snap.ask_walls
+            still_there = any(
+                abs(w.price - pos.reference_price) / pos.reference_price <= CFG.wall_max_distance_pct / 100
+                for w in walls
+            )
+            price_broke_through = (snap.mid < pos.reference_price) if pos.side == "long" \
+                else (snap.mid > pos.reference_price)
+            if not still_there and price_broke_through:
+                return True
+            # дисбаланс резко развернулся против позиции - давление сменилось
+            imb = snap.imbalance if pos.side == "long" else (1 - snap.imbalance)
+            if imb < (1 - CFG.imbalance_threshold):
+                return True
+            return False
+
+        if pos.signal_type == "breakout":
+            # Тезис: пробой удержался. Инвалидация - цена вернулась обратно за
+            # уровень пробоя (failed breakout / ложный пробой).
+            if pos.side == "long" and snap.mid < pos.reference_price:
+                return True
+            if pos.side == "short" and snap.mid > pos.reference_price:
+                return True
+            return False
+
+        return False
+
+    async def _update_trailing_stop(self, pos: ManagedPosition, price: float):
         improved = False
         if pos.side == "long" and price > pos.trailing_extreme:
             pos.trailing_extreme = price
@@ -260,15 +328,79 @@ class OrderManager:
             return
 
         pos.current_sl_price = new_sl
-        exit_is_ask = pos.side == "long"
-        # проще и надёжнее всего переставить стоп: он и так стоит на бирже reduce-only,
-        # выставляем новый на актуальный remaining size (cancel+create, т.к. modify требует order_index).
-        await self.exchange.create_sl_order(pos.market, next_client_order_index(), current_size, new_sl, exit_is_ask)
+        if CFG.mode == "live":
+            # Двигаем нативный резервный стоп на бирже (best-effort - order_index
+            # предыдущего SL не отслеживается и явно не отменяется, известное
+            # ограничение; на paper это не нужно - там протекция считается тут же).
+            live_pos = await self.exchange.get_position(pos.market)
+            current_size = abs(live_pos["size"]) if live_pos else pos.filled_size
+            exit_is_ask = pos.side == "long"
+            await self.exchange.create_sl_order(pos.market, next_client_order_index(),
+                                                 current_size, new_sl, exit_is_ask)
         log.info("[%s] трейлинг-стоп подтянут до %.2f (пик %.2f)", pos.symbol, new_sl, pos.trailing_extreme)
 
+    async def _partial_close(self, pos: ManagedPosition, snap, size: float, reason: str):
+        exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
+        price = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+        exit_price = price
+        try:
+            result, _, _ = await self.exchange.place_limit_order(
+                pos.market, next_client_order_index(), size, price, exit_is_ask,
+                reduce_only=True, post_only=False,
+            )
+            if result is not None:
+                filled = getattr(result, "filled_size", None)
+                avg = getattr(result, "avg_price", None)
+                if filled:
+                    size = filled
+                if avg:
+                    exit_price = avg
+        except Exception as e:
+            log.error("[%s] частичное закрытие (%s) не удалось: %s", pos.symbol, reason, e)
+            return
+
+        direction = 1 if pos.side == "long" else -1
+        pnl = (exit_price - pos.avg_entry) * direction * size
+        pos.realized_pnl += pnl
+        self.risk.register_close(pos.symbol, pos.side, pnl)
+        log.info("[%s] %s: закрыто %.6f по %.2f | PnL этой части=%.2f", pos.symbol, reason, size, exit_price, pnl)
+
+    async def _close_position_now(self, pos: ManagedPosition, snap, reason: str):
+        try:
+            live_pos = await self.exchange.get_position(pos.market)
+        except Exception:
+            live_pos = None
+        current_size = abs(live_pos["size"]) if live_pos else 0.0
+
+        exit_is_ask = pos.side == "long"
+        price = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+        exit_price = price
+        if current_size > 1e-9:
+            try:
+                result, _, _ = await self.exchange.place_limit_order(
+                    pos.market, next_client_order_index(), current_size, price, exit_is_ask,
+                    reduce_only=True, post_only=False,
+                )
+                if result is not None:
+                    avg = getattr(result, "avg_price", None)
+                    if avg:
+                        exit_price = avg
+            except Exception as e:
+                log.error("[%s] закрытие позиции (%s) не удалось: %s", pos.symbol, reason, e)
+
+        direction = 1 if pos.side == "long" else -1
+        pnl = (exit_price - pos.avg_entry) * direction * current_size
+        pos.realized_pnl += pnl
+        self.risk.register_close(pos.symbol, pos.side, pnl)
+        if self.trade_log and pos.trade_id is not None:
+            self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, reason)
+        self.positions.pop(pos.symbol, None)
+        log.info("[%s] позиция закрыта (%s): последний кусок %.6f по %.2f | PnL сделки суммарно=%.2f",
+                  pos.symbol, reason, current_size, exit_price, pos.realized_pnl)
+
     def _estimate_closed_pnl(self, pos: ManagedPosition):
-        # Best-effort оценка: без прямого фида по исполненным trade-репортам берём
-        # последнюю известную mid-цену как приближение цены выхода.
+        # Используется только аварийным flatten_all (kill switch) - best-effort
+        # оценка по последней известной mid-цене, без ожидания фактического филла.
         snap = self._latest_snap.get(pos.symbol)
         exit_price = snap.mid if snap else pos.avg_entry
         direction = 1 if pos.side == "long" else -1
@@ -296,23 +428,40 @@ class OrderManager:
                 live_pos = None
             size = abs(live_pos["size"]) if live_pos else pos.filled_size
 
+            exit_price = None
             if size > 1e-9:
                 exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
                 snap = self._latest_snap.get(symbol)
                 # закрываемся агрессивно (навстречу лучшей цене), не post-only - это аварийный выход
                 price = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
                 try:
-                    await self.exchange.place_limit_order(
+                    result, _, _ = await self.exchange.place_limit_order(
                         pos.market, next_client_order_index(), size, price, exit_is_ask,
                         reduce_only=True, post_only=False,
                     )
+                    avg = getattr(result, "avg_price", None) if result is not None else None
+                    exit_price = avg or price
                 except Exception as e:
                     log.error("[%s] не удалось закрыть позицию при kill switch: %s", symbol, e)
 
-            pnl, exit_price = self._estimate_closed_pnl(pos)
-            self.risk.register_close(symbol, pos.side, pnl)
+            # Итоговый PnL сделки = уже накопленное по прошлым частичным закрытиям
+            # (TP1 и т.п., см. pos.realized_pnl) + PnL последнего закрытого куска
+            # здесь. Не используем _estimate_closed_pnl.pnl напрямую - он посчитан
+            # от pos.filled_size (весь исходный размер), что задвоило бы PnL для
+            # позиций, у которых TP1 уже сработал до kill switch.
+            if exit_price is None:
+                _, exit_price = self._estimate_closed_pnl(pos)
+            chunk_pnl = 0.0
+            if size > 1e-9:
+                direction = 1 if pos.side == "long" else -1
+                chunk_pnl = (exit_price - pos.avg_entry) * direction * size
+                pos.realized_pnl += chunk_pnl
+            # equity двигаем только на PnL ИМЕННО этого (последнего) куска - PnL
+            # прошлых частичных закрытий (TP1 и т.п.) уже учтён в equity в момент
+            # их собственного register_close(); pos.realized_pnl - только для лога.
+            self.risk.register_close(symbol, pos.side, chunk_pnl)
             if self.trade_log and pos.trade_id is not None:
-                self.trade_log.close_trade(pos.trade_id, exit_price, pnl, f"kill_switch:{reason}")
+                self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, f"kill_switch:{reason}")
             self.positions.pop(symbol, None)
 
         for t in self._watchers.values():
