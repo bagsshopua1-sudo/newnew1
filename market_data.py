@@ -121,6 +121,21 @@ class MarketData:
 
     # ------------------------------------------------------------------ #
 
+    async def _diagnose_cloudfront_block(self, ws_url: str):
+        """Разовая диагностика: обычным HTTPS GET смотрим, что реально отвечает
+        CloudFront на этот адрес - тело JSON-ошибки скажет причину блокировки
+        (WAF/geo/IP-репутация и т.д.), которую сам вебсокет-хендшейк не показывает."""
+        import aiohttp
+        http_url = ws_url.replace("wss://", "https://").replace("ws://", "http://")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(http_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    text = await resp.text()
+                    log.warning("ДИАГНОСТИКА CloudFront: обычный GET на %s -> HTTP %d, тело: %s",
+                                http_url, resp.status, text[:1000])
+        except Exception as e:
+            log.warning("ДИАГНОСТИКА CloudFront: GET-запрос не удался: %s", e)
+
     async def start(self):
         market_ids = [m.market_index for m in self.markets.values()]
         # У Lighter WS-эндпоинт требует явного параметра encoding=json в query-строке -
@@ -135,6 +150,9 @@ class MarketData:
             account_ids=[],
             on_order_book_update=self._on_update,
         )
+        # Разовая диагностика в фоне: обычный HTTPS GET на тот же URL покажет
+        # тело JSON-ошибки CloudFront (сам WS-хендшейк тело не отдаёт).
+        asyncio.create_task(self._diagnose_cloudfront_block(ws_url))
         self._task = asyncio.create_task(self._run_with_reconnect())
         return self._task
 
