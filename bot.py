@@ -77,6 +77,10 @@ async def run_trading():
     async def binance_consumer():
         while True:
             snap = await binance.events.get()
+            # Сохраняем последний снепшот стакана Binance - это структура (стенки/
+            # дисбаланс), по которой order_manager._thesis_invalidated проверяет,
+            # жив ли ещё тезис сделки, пока позиция открыта (см. note_signal_snapshot).
+            orders.note_signal_snapshot(snap)
             lighter_snap = latest_lighter_snap.get(snap.symbol)
             if lighter_snap is None:
                 continue  # ещё нет цены Lighter для исполнения - подождём
