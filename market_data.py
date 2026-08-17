@@ -122,8 +122,14 @@ class MarketData:
 
     async def start(self):
         market_ids = [m.market_index for m in self.markets.values()]
+        # У Lighter WS-эндпоинт требует явного параметра encoding=json в query-строке -
+        # без него сервер отклоняет handshake (HTTP 400). Тот же приём использует
+        # встроенный lighter.PaperClient при подключении к стакану.
+        raw_ws_url = self.exchange.endpoint.ws_url
+        sep = "&" if "?" in raw_ws_url else "?"
+        ws_url = f"{raw_ws_url}{sep}encoding=json"
         self._ws = lighter.WsClient(
-            ws_url=self.exchange.endpoint.ws_url,
+            ws_url=ws_url,
             order_book_ids=market_ids,
             account_ids=[],
             on_order_book_update=self._on_update,
