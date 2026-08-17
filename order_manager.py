@@ -129,12 +129,24 @@ class OrderManager:
         for attempt in range(CFG.max_reprice_attempts + 1):
             snap = self._latest_snap.get(plan.symbol)
             touch_price = (snap.best_ask if is_ask else snap.best_bid) if snap else plan.entry_price
+
+            if CFG.mode == "paper":
+                # PaperClient умеет исполнять только пересекающие спред IOC-ордера
+                # (нет модели резидентной лимитки в очереди) - берём цену с
+                # противоположной стороны стакана и добавляем небольшой буфер,
+                # чтобы гарантированно пробить topbook и получить fill.
+                cross_price = (snap.best_bid if is_ask else snap.best_ask) if snap else plan.entry_price
+                buf = cross_price * CFG.paper_cross_buffer_pct / 100
+                order_price = (cross_price - buf) if is_ask else (cross_price + buf)
+            else:
+                order_price = touch_price
+
             log.info("[%s] попытка входа #%d: %s лимитка size=%.6f price=%.2f",
-                      plan.symbol, attempt + 1, "SELL" if is_ask else "BUY", remaining, touch_price)
+                      plan.symbol, attempt + 1, "SELL" if is_ask else "BUY", remaining, order_price)
 
             if CFG.mode == "paper":
                 result, _, _ = await self.exchange.place_limit_order(
-                    market, coi, remaining, touch_price, is_ask, post_only=False,
+                    market, coi, remaining, order_price, is_ask, post_only=False,
                 )
                 filled = getattr(result, "filled_size", 0.0) or 0.0
                 avg = getattr(result, "avg_price", touch_price) or touch_price
