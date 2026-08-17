@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import lighter
+import websockets.exceptions
 
 from config import CFG
 from exchange_client import MarketInfo
@@ -146,6 +147,20 @@ class MarketData:
                 await self._ws.run_async()
             except asyncio.CancelledError:
                 raise
+            except websockets.exceptions.InvalidStatus as e:
+                consecutive_failures += 1
+                resp = e.response
+                body = resp.body.decode("utf-8", errors="replace")[:500] if resp.body else "(пусто)"
+                headers = dict(resp.headers)
+                log.warning("WS ОТКЛОНЁН сервером: HTTP %d %s | заголовки=%s | тело=%s",
+                            resp.status_code, resp.reason_phrase, headers, body)
+                log.warning("Переподключение через %ss (попытка %d)", backoff, consecutive_failures)
+                if consecutive_failures >= 5 and not self._outage_notified and self.on_prolonged_outage:
+                    self._outage_notified = True
+                    asyncio.create_task(self.on_prolonged_outage("ws_disconnected"))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
             except Exception as e:
                 consecutive_failures += 1
                 log.warning("WS соединение оборвалось (%s), переподключение через %ss (попытка %d)",
