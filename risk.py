@@ -101,8 +101,24 @@ class RiskManager:
 
     # ------------------------------------------------------------------ #
 
-    def build_plan(self, symbol: str, side: str, entry_price: float) -> TradePlan:
-        stop_distance = entry_price * CFG.stop_loss_pct / 100
+    def build_plan(self, symbol: str, side: str, entry_price: float,
+                    wall_price: Optional[float] = None) -> TradePlan:
+        """
+        wall_price - цена стенки/уровня, который породил сигнал (Signal.reference_price).
+        Стоп считается от неё (+ буфер), а не фиксированным % - расстояние диктует
+        реальная структура рынка на момент сигнала, а не одно и то же число для
+        каждой сделки. Зажимаем в [MIN_STOP_PCT, MAX_STOP_PCT], чтобы не получить
+        ни слишком узкий стоп (шум выбьет), ни неоправданно широкий.
+        """
+        if wall_price:
+            raw_distance = abs(entry_price - wall_price) + entry_price * CFG.stop_buffer_pct / 100
+        else:
+            raw_distance = entry_price * CFG.stop_loss_pct / 100  # запасной вариант
+
+        min_distance = entry_price * CFG.min_stop_pct / 100
+        max_distance = entry_price * CFG.max_stop_pct / 100
+        stop_distance = min(max(raw_distance, min_distance), max_distance)
+
         risk_usd = self.equity * CFG.risk_per_trade_pct / 100
         raw_size = risk_usd / stop_distance  # база (в монете), риск ровно = risk_usd при срабатывании стопа
 
@@ -110,12 +126,14 @@ class RiskManager:
         max_notional = self.equity * CFG.max_leverage
         size = min(raw_size, max_notional / entry_price)
 
+        # TP1 = стоп-дистанция * risk:reward - тоже привязан к структуре через
+        # стоп, а не отдельный независимый фиксированный %.
         if side == "long":
             stop_price = entry_price - stop_distance
-            tp1_price = entry_price + entry_price * CFG.take_profit_1_pct / 100
+            tp1_price = entry_price + stop_distance * CFG.rr_target_1
         else:
             stop_price = entry_price + stop_distance
-            tp1_price = entry_price - entry_price * CFG.take_profit_1_pct / 100
+            tp1_price = entry_price - stop_distance * CFG.rr_target_1
 
         return TradePlan(
             symbol=symbol,
