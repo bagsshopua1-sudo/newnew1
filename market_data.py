@@ -147,13 +147,20 @@ class MarketData:
                 await self._ws.run_async()
             except asyncio.CancelledError:
                 raise
-            except websockets.exceptions.InvalidStatus as e:
+            except (websockets.exceptions.InvalidStatus, websockets.exceptions.InvalidStatusCode) as e:
                 consecutive_failures += 1
-                resp = e.response
-                body = resp.body.decode("utf-8", errors="replace")[:500] if resp.body else "(пусто)"
-                headers = dict(resp.headers)
-                log.warning("WS ОТКЛОНЁН сервером: HTTP %d %s | заголовки=%s | тело=%s",
-                            resp.status_code, resp.reason_phrase, headers, body)
+                # lighter.WsClient использует старое (legacy) API websockets, которое кидает
+                # InvalidStatusCode (только status_code + headers, без тела ответа); новое API
+                # кидает InvalidStatus (есть ещё и e.response.body) - обрабатываем оба варианта.
+                if hasattr(e, "response"):
+                    resp = e.response
+                    body = resp.body.decode("utf-8", errors="replace")[:500] if resp.body else "(пусто)"
+                    headers = dict(resp.headers)
+                    log.warning("WS ОТКЛОНЁН сервером: HTTP %d | заголовки=%s | тело=%s",
+                                resp.status_code, headers, body)
+                else:
+                    log.warning("WS ОТКЛОНЁН сервером: HTTP %d | заголовки=%s",
+                                e.status_code, dict(e.headers))
                 log.warning("Переподключение через %ss (попытка %d)", backoff, consecutive_failures)
                 if consecutive_failures >= 5 and not self._outage_notified and self.on_prolonged_outage:
                     self._outage_notified = True
