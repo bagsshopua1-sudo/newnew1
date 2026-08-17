@@ -45,8 +45,21 @@ class Config:
 
     account_equity_usd: float = field(default_factory=lambda: _f("ACCOUNT_EQUITY_USD", 1000))
     risk_per_trade_pct: float = field(default_factory=lambda: _f("RISK_PER_TRADE_PCT", 1.0))
+    # Запасной вариант для build_plan(), если по какой-то причине нет уровня-опоры
+    # (сигнальной стенки) - в норме не используется, стоп считается от структуры.
     stop_loss_pct: float = field(default_factory=lambda: _f("STOP_LOSS_PCT", 0.6))
     take_profit_1_pct: float = field(default_factory=lambda: _f("TAKE_PROFIT_1_PCT", 0.6))
+    # === "Умный" стоп - от структуры (стенки/уровня сигнала), а не одинаковый % ===
+    # Стоп = |entry - reference_price сигнала| + буфер, зажатый в [MIN_STOP_PCT, MAX_STOP_PCT]
+    # от цены входа. Так расстояние до стопа определяется реальным уровнем, который
+    # породил сигнал (и текущей волатильностью через сам уровень), а не произвольным
+    # одинаковым числом для каждой сделки. Клампы нужны, чтобы не словить ни аномально
+    # узкий стоп (шум выбивает), ни аномально широкий (непропорциональный риск).
+    min_stop_pct: float = field(default_factory=lambda: _f("MIN_STOP_PCT", 0.15))
+    max_stop_pct: float = field(default_factory=lambda: _f("MAX_STOP_PCT", 1.5))
+    stop_buffer_pct: float = field(default_factory=lambda: _f("STOP_BUFFER_PCT", 0.05))
+    # TP1 = стоп-дистанция * это отношение (risk:reward), а не отдельный фиксированный %.
+    rr_target_1: float = field(default_factory=lambda: _f("RR_TARGET_1", 1.5))
     take_profit_1_size: float = field(default_factory=lambda: _f("TAKE_PROFIT_1_SIZE", 0.5))
     trailing_stop_pct: float = field(default_factory=lambda: _f("TRAILING_STOP_PCT", 0.4))
     max_leverage: float = field(default_factory=lambda: _f("MAX_LEVERAGE", 3))
@@ -56,6 +69,13 @@ class Config:
 
     order_fill_timeout_sec: float = field(default_factory=lambda: _f("ORDER_FILL_TIMEOUT_SEC", 8))
     max_reprice_attempts: int = field(default_factory=lambda: _i("MAX_REPRICE_ATTEMPTS", 3))
+    # Как часто (сек) проверять открытую позицию: срабатывание стопа/тейка по цене
+    # и "умный" выход по развалу структуры сделки (см. order_manager._thesis_invalidated).
+    position_check_interval_sec: float = field(default_factory=lambda: _f("POSITION_CHECK_INTERVAL_SEC", 1.0))
+    # Сколько секунд после входа не проверять развал структуры - без этого шум
+    # сразу после входа (цена на секунду качнулась к стенке) может закрыть
+    # сделку мгновенно, прежде чем тезис вообще успел подтвердиться или нет.
+    thesis_grace_period_sec: float = field(default_factory=lambda: _f("THESIS_GRACE_PERIOD_SEC", 5.0))
     # lighter.PaperClient не умеет держать "висящую" лимитку в очереди - IOC либо
     # исполняется сразу против противоположной стороны стакана, либо отменяется
     # целиком. Чтобы paper-режим вообще мог исполнять сделки, вход ставится с
@@ -77,8 +97,11 @@ class Config:
     # У Lighter стакан тоньше, чем у Binance - крупные заявки на Binance надёжнее
     # отражают реальный интерес. Исполнение всё равно на Lighter (0 комиссий).
     use_binance_signals: bool = field(default_factory=lambda: _s("USE_BINANCE_SIGNALS", "true").lower() == "true")
-    binance_poll_interval_sec: float = field(default_factory=lambda: _f("BINANCE_POLL_INTERVAL_SEC", 1.5))
-    binance_depth_limit: int = field(default_factory=lambda: _i("BINANCE_DEPTH_LIMIT", 500))
+    # WebSocket partial book depth: сколько уровней (5/10/20) и с какой скоростью
+    # обновления (100/250/500 мс). REST-поллинг не используется - Binance банит IP
+    # за превышение веса запросов (см. binance_feed.py), WS для market-data так не тарифицируется.
+    binance_ws_depth_levels: int = field(default_factory=lambda: _i("BINANCE_WS_DEPTH_LEVELS", 20))
+    binance_ws_speed_ms: int = field(default_factory=lambda: _i("BINANCE_WS_SPEED_MS", 500))
     # Стакан Binance на порядки глубже Lighter - порог WALL_MIN_USD, откалиброванный
     # под тонкий Lighter, на Binance будет ловить мусорные "стенки" почти на каждом
     # тике. Нужен отдельный, заметно более высокий порог - точное значение требует
