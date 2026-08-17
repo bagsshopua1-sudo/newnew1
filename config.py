@@ -73,6 +73,22 @@ class Config:
     vol_lookback: int = field(default_factory=lambda: _i("VOL_LOOKBACK", 60))
     vol_spike_mult: float = field(default_factory=lambda: _f("VOL_SPIKE_MULT", 3.0))
 
+    # === Источник сигнала - стакан Binance Futures (публичный REST, без ключей) ===
+    # У Lighter стакан тоньше, чем у Binance - крупные заявки на Binance надёжнее
+    # отражают реальный интерес. Исполнение всё равно на Lighter (0 комиссий).
+    use_binance_signals: bool = field(default_factory=lambda: _s("USE_BINANCE_SIGNALS", "true").lower() == "true")
+    binance_poll_interval_sec: float = field(default_factory=lambda: _f("BINANCE_POLL_INTERVAL_SEC", 1.5))
+    binance_depth_limit: int = field(default_factory=lambda: _i("BINANCE_DEPTH_LIMIT", 500))
+    # Стакан Binance на порядки глубже Lighter - порог WALL_MIN_USD, откалиброванный
+    # под тонкий Lighter, на Binance будет ловить мусорные "стенки" почти на каждом
+    # тике. Нужен отдельный, заметно более высокий порог - точное значение требует
+    # эмпирической калибровки (как и было задумано MODE=collect), это стартовое
+    # приближение, не проверенное вживую.
+    binance_wall_min_usd: float = field(default_factory=lambda: _f("BINANCE_WALL_MIN_USD", 2_000_000))
+    # Если цена Lighter разошлась с Binance больше чем на столько % - сигнал с
+    # Binance пропускаем: базис слишком большой, вход по нему не оправдан.
+    basis_max_divergence_pct: float = field(default_factory=lambda: _f("BASIS_MAX_DIVERGENCE_PCT", 0.15))
+
     def validate(self):
         assert self.mode in ("collect", "paper", "live"), f"Неизвестный MODE={self.mode}"
         assert self.network in ("mainnet", "testnet"), f"Неизвестная NETWORK={self.network}"
