@@ -68,11 +68,17 @@ class ExchangeClient:
                 api_private_keys={CFG.api_key_index: CFG.api_private_key},
             )
         elif CFG.mode == "paper":
+            # PaperClient сам поднимает отдельный WS-листенер на стакан для симуляции
+            # исполнения - ему, как и основному MarketData, нужен ?encoding=json в URL,
+            # иначе он получит бинарный фрейм и упадёт с TypeError при первом сообщении.
+            raw_ws_url = self.endpoint.ws_url
+            sep = "&" if "?" in raw_ws_url else "?"
+            paper_ws_url = f"{raw_ws_url}{sep}encoding=json"
             self.paper = lighter.PaperClient(
                 api_client=self.api_client,
                 initial_collateral_usdc=CFG.account_equity_usd,
                 order_api=self.order_api,
-                ws_url=self.endpoint.ws_url,
+                ws_url=paper_ws_url,
             )
 
     async def resolve_markets(self):
@@ -98,6 +104,16 @@ class ExchangeClient:
             )
             log.info("Рынок %s -> market_index=%s price_dec=%s size_dec=%s",
                       sym, m.market_id, d.price_decimals, d.size_decimals)
+
+        if self.paper:
+            # PaperClient требует явного track_market() перед create_paper_order -
+            # без этого он падает с ValueError("market not tracked"). Это поднимает
+            # собственный WS-листенер на стакан внутри PaperClient (независимо от
+            # MarketData) и ждёт первый снепшот, поэтому может занять пару секунд.
+            for sym, market in self.markets.items():
+                await self.paper.track_market(market.market_index)
+                log.info("Paper-трекинг стакана %s (market_index=%s) запущен", sym, market.market_index)
+
         return self.markets
 
     async def auth_token(self) -> str:
@@ -134,14 +150,18 @@ class ExchangeClient:
                 log.error("create_order error: %s", err)
             return tx, resp, err
         elif CFG.mode == "paper":
+            # У lighter.PaperOrderType нет LIMIT (есть только IOC и MARKET) - IOC
+            # ближе всего к нашей семантике "лимитка по touch-цене, не исполнилось
+            # сразу -> остаток отменяется" (chase-цикл сам переставляет её заново).
+            # PaperOrderRequest также не принимает reduce_only - PaperClient сам
+            # неттингует позицию по знаку размера, отдельный флаг не нужен.
             side = lighter.PaperOrderSide.SELL if is_ask else lighter.PaperOrderSide.BUY
             req = lighter.PaperOrderRequest(
                 market_id=market.market_index,
                 side=side,
-                order_type=lighter.PaperOrderType.LIMIT,
-                base_amount=size,
-                price=price,
-                reduce_only=reduce_only,
+                order_type=lighter.PaperOrderType.IOC,
+                base_amount=round(size, market.size_decimals),
+                price=round(price, market.price_decimals),
             )
             result = await self.paper.create_paper_order(req)
             return result, None, None
@@ -208,16 +228,16 @@ class ExchangeClient:
         paper -> PaperClient.get_position; live -> AccountApi.account(...).positions.
         """
         if CFG.mode == "paper":
-            pos = await self.paper.get_position(market.market_index)
+            # PaperClient.get_position - обычный (не async) метод, await на нём
+            # падает с TypeError; поле размера у PaperPosition называется "size",
+            # не "position".
+            pos = self.paper.get_position(market.market_index)
             if pos is None:
                 return None
-            size = getattr(pos, "position", None)
-            if size is None:
-                return None
-            size = float(size)
+            size = float(pos.size)
             if size == 0:
                 return None
-            return {"size": size, "avg_entry": float(getattr(pos, "avg_entry_price", 0))}
+            return {"size": size, "avg_entry": float(pos.avg_entry_price)}
 
         if CFG.mode == "live":
             resp = await self.account_api.account(by="index", value=str(CFG.account_index))
