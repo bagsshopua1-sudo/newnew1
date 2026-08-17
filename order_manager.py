@@ -61,6 +61,10 @@ class OrderManager:
         self.positions: Dict[str, ManagedPosition] = {}  # symbol -> position
         self._watchers: Dict[str, asyncio.Task] = {}
         self._latest_snap: Dict[str, "BookSnapshot"] = {}
+        # Символы, для которых прямо сейчас идёт попытка входа (между сигналом и
+        # регистрацией позиции есть await, поэтому has_position() одна не спасает
+        # от гонки, если за это время прилетит ещё один сигнал по тому же символу).
+        self._entering: set = set()
 
     def note_snapshot(self, snap):
         self._latest_snap[snap.symbol] = snap
@@ -75,8 +79,8 @@ class OrderManager:
     async def handle_signal(self, market: MarketInfo, signal: Signal):
         if self.kill_switch and self.kill_switch.active:
             return  # аварийная остановка активна - новых входов нет
-        if self.has_position(signal.symbol):
-            log.debug("[%s] уже есть открытая позиция, сигнал пропущен", signal.symbol)
+        if self.has_position(signal.symbol) or signal.symbol in self._entering:
+            log.debug("[%s] уже есть открытая позиция или вход в процессе, сигнал пропущен", signal.symbol)
             return
         if not self.risk.can_trade():
             return
@@ -87,26 +91,33 @@ class OrderManager:
                         signal.symbol, plan.size)
             return
 
-        filled_size, avg_entry = await self._enter_with_chase(market, plan)
-        if filled_size <= 0:
-            log.info("[%s] вход не удался (лимитка не исполнилась за %d попыток)",
-                      signal.symbol, CFG.max_reprice_attempts + 1)
-            return
+        # Синхронно (без await между проверкой и пометкой) резервируем символ,
+        # чтобы параллельный сигнал по нему не начал второй вход, пока этот ждёт
+        # исполнения лимитки.
+        self._entering.add(signal.symbol)
+        try:
+            filled_size, avg_entry = await self._enter_with_chase(market, plan)
+            if filled_size <= 0:
+                log.info("[%s] вход не удался (лимитка не исполнилась за %d попыток)",
+                          signal.symbol, CFG.max_reprice_attempts + 1)
+                return
 
-        pos = ManagedPosition(
-            symbol=signal.symbol, side=plan.side, market=market, plan=plan,
-            filled_size=filled_size, avg_entry=avg_entry, current_sl_price=plan.stop_price,
-        )
-        self.positions[signal.symbol] = pos
-        if self.trade_log:
-            pos.trade_id = self.trade_log.open_trade(
-                signal.symbol, plan.side, avg_entry, filled_size, signal.signal_type
+            pos = ManagedPosition(
+                symbol=signal.symbol, side=plan.side, market=market, plan=plan,
+                filled_size=filled_size, avg_entry=avg_entry, current_sl_price=plan.stop_price,
             )
-        log.info("[%s] ПОЗИЦИЯ ОТКРЫТА %s size=%.6f avg_entry=%.2f SL=%.2f TP1=%.2f",
-                  signal.symbol, plan.side.upper(), filled_size, avg_entry, plan.stop_price, plan.tp1_price)
+            self.positions[signal.symbol] = pos
+            if self.trade_log:
+                pos.trade_id = self.trade_log.open_trade(
+                    signal.symbol, plan.side, avg_entry, filled_size, signal.signal_type
+                )
+            log.info("[%s] ПОЗИЦИЯ ОТКРЫТА %s size=%.6f avg_entry=%.2f SL=%.2f TP1=%.2f",
+                      signal.symbol, plan.side.upper(), filled_size, avg_entry, plan.stop_price, plan.tp1_price)
 
-        await self._place_protective_orders(pos)
-        self._watchers[signal.symbol] = asyncio.create_task(self._watch_position(pos))
+            await self._place_protective_orders(pos)
+            self._watchers[signal.symbol] = asyncio.create_task(self._watch_position(pos))
+        finally:
+            self._entering.discard(signal.symbol)
 
     async def _enter_with_chase(self, market: MarketInfo, plan: TradePlan):
         is_ask = plan.side == "short"  # short = продаём, long = покупаем
