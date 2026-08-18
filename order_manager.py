@@ -112,6 +112,14 @@ class ManagedPosition:
     # 2 тика) не успевал это отфильтровать - серия 69 сделок за 26 минут по
     # 8-40 сек, PnL -13.59. См. WALL_DOMINANCE_CONFIRM_TICKS в config.py.
     wall_dominance_streak: int = 0
+    # Те же отдельные счётчики для ДВУХ других веток _thesis_invalidated
+    # (ABSORPTION) - "стенку съели, цена стоит на месте" и "дисбаланс
+    # развернулся". Найдено в проде 18.08 вечером: фикс одного только
+    # wall_dominance_streak не изменил картину (49 из 60 сделок всё ещё
+    # structure_invalidated за 13-90 сек) - значит основной шум шёл через
+    # эти две ветки, которые до этого закрывали мгновенно, за 1 тик.
+    wall_eaten_streak: int = 0
+    imbalance_streak: int = 0
 
 
 class OrderManager:
@@ -675,7 +683,11 @@ class OrderManager:
                 else (snap.mid > pos.reference_price)
             if not still_there:
                 if price_broke_through:
-                    # реальный слом структуры - цена уже прошла уровень стенки
+                    # реальный слом структуры - цена уже прошла уровень стенки.
+                    # Это НЕ голое сравнение размеров стенок (как dominance
+                    # выше) - тут два условия сразу (стенки нет И цена уже
+                    # прошла её уровень), само по себе достаточно решительно -
+                    # оставляем мгновенным (только через общий invalidation_streak).
                     return True
                 # Стенка пропала (съедена реальным объёмом или снята), но цена
                 # ЕЩЁ НЕ пробила её уровень против нас - смотрим, куда цена
@@ -691,14 +703,37 @@ class OrderManager:
                 # пошла куда надо - ровно на этом строится отдельный сигнал
                 # BREAKOUT в signals.py) - не режем прибыль, даём тейку/
                 # трейлингу отработать как обычно.
+                # Найдено в проде 18.08 вечером (после фикса dominance-streak,
+                # структура закрытий не улучшилась - 49 из 60 сделок всё ещё
+                # structure_invalidated за 13-90 сек): exec_snap - это ТИК
+                # снепшот стакана Lighter, "стенки нет" может быть тем же
+                # секундным дёрганьем, что и dominance выше - см. комментарий
+                # там. Даём тот же 3-тиковый счётчик, а не мгновенный выход.
+                wall_eaten_flat_now = False
                 if exec_snap is not None:
                     profit_pct = ((exec_snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
                         else ((pos.avg_entry - exec_snap.mid) / pos.avg_entry * 100)
-                    if abs(profit_pct) <= CFG.wall_eaten_flat_pct:
-                        return True
-            # дисбаланс резко развернулся против позиции - давление сменилось
+                    wall_eaten_flat_now = abs(profit_pct) <= CFG.wall_eaten_flat_pct
+                if wall_eaten_flat_now:
+                    pos.wall_eaten_streak += 1
+                else:
+                    pos.wall_eaten_streak = 0
+                if pos.wall_eaten_streak >= CFG.wall_dominance_confirm_ticks:
+                    return True
+            else:
+                pos.wall_eaten_streak = 0
+            # дисбаланс резко развернулся против позиции - давление сменилось.
+            # Тот же случай, что и dominance/wall_eaten выше - сырой imbalance
+            # на одном тике самый шумный из всех трёх (дёргается вместе с
+            # displayed size стенок, см. комментарий у wall_dominance_ratio) -
+            # даём такой же 3-тиковый счётчик вместо мгновенного выхода.
             imb = snap.imbalance if pos.side == "long" else (1 - snap.imbalance)
-            if imb < (1 - CFG.imbalance_threshold):
+            imbalance_flip_now = imb < (1 - CFG.imbalance_threshold)
+            if imbalance_flip_now:
+                pos.imbalance_streak += 1
+            else:
+                pos.imbalance_streak = 0
+            if pos.imbalance_streak >= CFG.wall_dominance_confirm_ticks:
                 return True
             return False
 
