@@ -95,6 +95,15 @@ class ManagedPosition:
     # измерить упущенный потенциал выхода было нельзя (см. AUDIT_2026-08-18.md).
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
+    # THESIS VALID/WEAKENING/INVALIDATED (аудит стратегии, этап 5, 18.08) -
+    # WEAKENING - новое промежуточное состояние между "всё ок" и "закрываем
+    # всё" (см. _watch_position): позиция уже была заметно в плюсе (MFE), но
+    # заметная часть этого пути откатилась назад, хотя формальная структура
+    # ещё не сломана (INVALIDATED, см. _thesis_invalidated - логика ТАМ не
+    # меняется). При WEAKENING - частичный выход (фиксируем часть уже
+    # заработанного), не более одного раза за сделку.
+    thesis_state: str = "VALID"
+    weakening_partial_done: bool = False
 
 
 class OrderManager:
@@ -451,18 +460,34 @@ class OrderManager:
                         # тихо теряли часть профит-тейка навсегда. Теперь запрашиваем
                         # только незакрытый остаток tp1_size и подтверждаем TP1
                         # только когда он реально закрыт целиком (см. pos.tp1_filled).
-                        remaining_tp1 = pos.plan.tp1_size - pos.tp1_filled
-                        filled_now = await self._partial_close(pos, snap, remaining_tp1, "tp1")
-                        pos.tp1_filled += filled_now
-                        if pos.tp1_filled >= pos.plan.tp1_size - 1e-6:
+                        # min(..., pos.filled_size) - добавлено 18.08 (этап 5 аудита):
+                        # THESIS WEAKENING (см. выше) мог частично закрыть позицию ДО
+                        # TP1, оставшийся фактический размер тогда меньше, чем
+                        # изначально запланированный tp1_size - без каппинга запрос
+                        # на закрытие мог бы попытаться закрыть больше, чем реально
+                        # осталось от позиции.
+                        remaining_tp1 = min(pos.plan.tp1_size - pos.tp1_filled, pos.filled_size)
+                        if remaining_tp1 <= 1e-9:
+                            # WEAKENING уже закрыл не меньше, чем предполагал план TP1 -
+                            # по факту план TP1 выполнен остатком позиции.
                             pos.tp1_done = True
                             pos.trailing_active = True
                             pos.trailing_extreme = price
-                            log.info("[%s] TP1 сработал полностью, остаток переведён на трейлинг-стоп %.2f%%",
+                            log.info("[%s] TP1 пропущен (WEAKENING уже закрыл достаточно) - "
+                                      "остаток переведён на трейлинг-стоп %.2f%%",
                                       pos.symbol, pos.plan.trailing_stop_pct)
                         else:
-                            log.warning("[%s] TP1 исполнился частично (%.6f из %.6f) - повторим остаток "
-                                        "на следующей проверке", pos.symbol, pos.tp1_filled, pos.plan.tp1_size)
+                            filled_now = await self._partial_close(pos, snap, remaining_tp1, "tp1")
+                            pos.tp1_filled += filled_now
+                            if pos.tp1_filled >= pos.plan.tp1_size - 1e-6 or pos.filled_size <= 1e-9:
+                                pos.tp1_done = True
+                                pos.trailing_active = True
+                                pos.trailing_extreme = price
+                                log.info("[%s] TP1 сработал полностью, остаток переведён на трейлинг-стоп %.2f%%",
+                                          pos.symbol, pos.plan.trailing_stop_pct)
+                            else:
+                                log.warning("[%s] TP1 исполнился частично (%.6f из %.6f) - повторим остаток "
+                                            "на следующей проверке", pos.symbol, pos.tp1_filled, pos.plan.tp1_size)
 
                 if pos.trailing_active:
                     await self._update_trailing_stop(pos, price)
@@ -484,16 +509,32 @@ class OrderManager:
                     pos.invalidation_streak = 0
                     continue
 
-                # TIME_EXIT (этап 2.3 аудита, 18.08) - если сделка висит дольше
-                # TIME_EXIT_SEC и так и не сдвинулась в нашу пользу дальше
-                # TIME_EXIT_MIN_PROFIT_PCT, тезис явно не отрабатывает так, как
-                # рассчитано (это стратегия на быстрый импульс/поглощение, не на
-                # "подождать подольше") - закрываем, вместо неопределённо долгого
-                # ожидания стопа. БАЗОВАЯ версия без учёта волатильности/режима -
-                # уточнение (только для micro-scalping, с поправкой на текущий
-                # regime) запланировано в этапе 5 аудита.
+                # TIME_EXIT (этап 2.3, уточнено в этапе 5 аудита 18.08). Если
+                # сделка висит дольше эффективного лимита и так и не сдвинулась
+                # в нашу пользу дальше TIME_EXIT_MIN_PROFIT_PCT - тезис явно не
+                # отрабатывает так, как рассчитано, закрываем вместо
+                # неопределённо долгого ожидания стопа. Лимит теперь НЕ один и
+                # тот же для всех сделок:
+                #  - ABSORPTION - это ставка на быстрый micro-scalp импульс, у
+                #    неё короткий базовый лимит (TIME_EXIT_SEC);
+                #  - BREAKOUT - продолжение тренда, ему законно нужно больше
+                #    времени на разгон (TIME_EXIT_BREAKOUT_SEC, заметно выше);
+                # и масштабируется текущей волатильностью НА ВХОДЕ (см.
+                # Signal.volatility_pct/pos.entry_volatility_pct) относительно
+                # референса TIME_EXIT_VOL_REF_PCT - выше волатильность, чем
+                # референс, короче окно (быстрее должно стать понятно, сработал
+                # ли тезис), ниже волатильность - окно шире, зажато в
+                # [TIME_EXIT_MIN_SEC, TIME_EXIT_MAX_SEC].
+                base_time_exit_sec = CFG.time_exit_sec if pos.signal_type == "absorption" \
+                    else CFG.time_exit_breakout_sec
+                vol_scale = 1.0
+                if pos.entry_volatility_pct > 0:
+                    vol_scale = min(max(CFG.time_exit_vol_ref_pct / pos.entry_volatility_pct, 0.5), 2.0)
+                effective_time_exit_sec = min(
+                    max(base_time_exit_sec * vol_scale, CFG.time_exit_min_sec), CFG.time_exit_max_sec)
+
                 elapsed = time.time() - pos.opened_at
-                if elapsed >= CFG.time_exit_sec and profit_pct < CFG.time_exit_min_profit_pct:
+                if elapsed >= effective_time_exit_sec and profit_pct < CFG.time_exit_min_profit_pct:
                     pos.pending_close_reason = "time_exit"
                     await self._close_position_safely(pos, snap, "time_exit")
                     if not self.has_position(pos.symbol):
@@ -527,12 +568,40 @@ class OrderManager:
                 # exec-цены Lighter) - переиспользуем вместо пересчёта.
                 already_profitable = profit_pct > CFG.wall_eaten_flat_pct
 
+                # THESIS WEAKENING (этап 5 аудита, 18.08) - промежуточное
+                # состояние между VALID и INVALIDATED: формальная структура
+                # (стенка/уровень) ещё не сломана (thesis_invalid=False - если
+                # уже True, ниже сработает полноценный INVALIDATED-путь, эта
+                # ветка тут не нужна), но позиция уже набирала заметный ход
+                # (MFE) и заметная его часть откатилась назад - импульс явно
+                # затухает. Не завязано на invalidation_streak - решение
+                # принимается сразу, но частичный выход срабатывает не больше
+                # одного раза за сделку (weakening_partial_done).
+                if (not thesis_invalid and not pos.weakening_partial_done
+                        and pos.mfe_pct > CFG.wall_eaten_flat_pct * CFG.weakening_mfe_min_mult
+                        and profit_pct > 0):
+                    retrace_pct = pos.mfe_pct - profit_pct
+                    if retrace_pct >= pos.mfe_pct * CFG.momentum_decay_retrace_pct:
+                        close_amount = pos.filled_size * CFG.weakening_partial_close_pct
+                        if close_amount > 0:
+                            filled_now = await self._partial_close(pos, snap, close_amount, "thesis_weakening")
+                            if filled_now > 0:
+                                pos.weakening_partial_done = True
+                                pos.thesis_state = "WEAKENING"
+                                log.info("[%s] THESIS WEAKENING: закрыто %.1f%% позиции "
+                                          "(MFE=%.3f%% профит сейчас=%.3f%% откат=%.3f%%)",
+                                          pos.symbol, CFG.weakening_partial_close_pct * 100,
+                                          pos.mfe_pct, profit_pct, retrace_pct)
+                            if not self.has_position(pos.symbol):
+                                return
+
                 if thesis_invalid and not already_profitable:
                     pos.invalidation_streak += 1
                 else:
                     pos.invalidation_streak = 0
 
                 if pos.invalidation_streak >= CFG.invalidation_confirm_ticks:
+                    pos.thesis_state = "INVALIDATED"
                     pos.pending_close_reason = "structure_invalidated"
                     await self._close_position_safely(pos, snap, "structure_invalidated")
                     if not self.has_position(pos.symbol):
