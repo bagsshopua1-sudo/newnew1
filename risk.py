@@ -92,13 +92,34 @@ class RiskManager:
     # ------------------------------------------------------------------ #
 
     def build_plan(self, symbol: str, side: str, entry_price: float,
-                    wall_price: Optional[float] = None) -> TradePlan:
+                    wall_price: Optional[float] = None, wall_usd: float = 0.0,
+                    backup_usd: float = 0.0) -> TradePlan:
         """
         wall_price - цена стенки/уровня, который породил сигнал (Signal.reference_price).
         Стоп считается от неё (+ буфер), а не фиксированным % - расстояние диктует
         реальная структура рынка на момент сигнала, а не одно и то же число для
         каждой сделки. Зажимаем в [MIN_STOP_PCT, MAX_STOP_PCT], чтобы не получить
         ни слишком узкий стоп (шум выбьет), ни неоправданно широкий.
+
+        wall_usd/backup_usd - размер стенки и подложки за ней (Signal.wall_usd/
+        backup_usd, см. signals.py). ПРОБЛЕМА, которую это решает: при входе по
+        ABSORPTION мы заходим ПРЯМО у стенки, поэтому |entry-wall_price| ~ 0 -
+        raw_distance почти всегда падал на голый MIN_STOP_PCT floor, то есть стоп
+        был на фиксированном % от цены, вообще не привязанном ни к какому
+        реальному уровню в стакане (жалоба пользователя: "заходим по заявке 2кк,
+        а стоп где-то у какой-то другой заявки"). Вместо этого масштабируем
+        дистанцию реальной глубиной ЗА стенкой: чем сильнее подложка относительно
+        размера стенки, тем больше похоже, что уровень продержится под давлением,
+        и тем больше места даём стопу (до края WALL_BACKUP_RANGE_PCT) - вместо
+        того, чтобы резать по проценту "на глаз". При тонкой подложке (она и так
+        уже отсеивается фильтром WALL_BACKUP_MIN_RATIO на входе, см. signals.py)
+        дистанция остаётся у нижнего края (MIN_STOP_PCT). ВАЖНО: это НЕ ставка на
+        то, что именно эта ликвидность будет жива к моменту срабатывания стопа -
+        за миллисекунды она может исчезнуть так же, как и сама стенка (см.
+        WALL_CANDIDATE-логи со спуфингом). Подложка тут только определяет
+        ДИСТАНЦИЮ/риск сделки в моменте входа, а не место будущего исполнения -
+        закрывающий ордер по-прежнему бьёт по реальному живому стакану Lighter в
+        момент закрытия (_close_price/create_sl_order), а не по этой цифре.
         """
         if wall_price:
             raw_distance = abs(entry_price - wall_price) + entry_price * CFG.stop_buffer_pct / 100
@@ -107,6 +128,13 @@ class RiskManager:
 
         min_distance = entry_price * CFG.min_stop_pct / 100
         max_distance = entry_price * CFG.max_stop_pct / 100
+
+        if wall_usd > 0 and backup_usd > 0:
+            backup_ratio = min(backup_usd / wall_usd, 1.0)
+            backup_edge_distance = entry_price * CFG.wall_backup_range_pct / 100
+            structural_distance = min_distance + (backup_edge_distance - min_distance) * backup_ratio
+            raw_distance = max(raw_distance, structural_distance)
+
         stop_distance = min(max(raw_distance, min_distance), max_distance)
 
         risk_usd = self.equity * CFG.risk_per_trade_pct / 100
