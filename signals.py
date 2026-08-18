@@ -90,6 +90,22 @@ class _TrackedWall:
     update_count: int = 0
     refill_count: int = 0  # сколько раз displayed size заметно восстановился после просадки
     last_candidate_log_ts: float = 0.0
+    # Когда последний раз реально ОТДАВАЛИ сигнал по этой стенке (не лог
+    # кандидата, а настоящий Signal). Раньше единственной защитой от повторного
+    # срабатывания был tw.stall_count = 0 после выдачи сигнала - но в проде
+    # снепшоты Binance WS иногда приходят "пачкой" (несколько сообщений почти
+    # одновременно, в пределах миллисекунд, а не штатным интервалом
+    # BINANCE_WS_SPEED_MS) - в такой пачке mid почти не меняется между
+    # соседними снепшотами пачки, поэтому "топчется" (stall) условие снова
+    # истинно почти сразу, и stall_count успевает повторно дойти до
+    # ABSORPTION_STALL_TICKS ещё ВНУТРИ этой же пачки - сигнал по факту одной
+    # и той же стенки выдавался по 10-40 раз за миллисекунды (см. лог-спам
+    # "СИГНАЛ ... confidence=0.75" повторяющийся с одинаковым timestamp).
+    # Кроме бесполезной нагрузки на CPU/логи, каждый такой повтор запускал
+    # отдельный asyncio.create_task(handle_signal(...)) - гонка между ними
+    # разбирается отдельно в order_manager.py, но правильнее в принципе не
+    # выдавать по факту один и тот же сигнал десятки раз подряд.
+    last_signal_ts: float = 0.0
 
 
 class SignalEngine:
@@ -268,6 +284,14 @@ class SignalEngine:
         for tw in self.tracked.values():
             age = now - tw.first_seen
             if age >= self.min_wall_age_sec and tw.stall_count >= CFG.absorption_stall_ticks:
+                # Минимальный интервал между повторными сигналами по ОДНОЙ И ТОЙ
+                # ЖЕ стенке - защита от пачек снепшотов, приходящих почти
+                # одновременно (см. комментарий у _TrackedWall.last_signal_ts).
+                # Не влияет на скорость ПЕРВОГО входа (min_wall_age_sec/
+                # absorption_stall_ticks по-прежнему решают это) - только
+                # глушит бессмысленные повторы одного и того же вывода.
+                if now - tw.last_signal_ts < CFG.absorption_min_refire_sec:
+                    continue
                 side = "short" if tw.wall.side == "ask" else "long"
                 if not TrendFilter.allows_fade(side, trend_state):
                     continue  # не фейдим против сильного тренда
@@ -297,6 +321,7 @@ class SignalEngine:
                 log.info("[%s] ABSORPTION %s у %.2f (стенка стоит %.1fs, %.0f USD, stall=%d)",
                           self.symbol, side.upper(), tw.wall.price, age, tw.max_usd, tw.stall_count)
                 tw.stall_count = 0  # чтобы не спамить сигналами каждую секунду
+                tw.last_signal_ts = now
                 return sig
 
         return None
