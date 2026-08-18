@@ -61,6 +61,17 @@ class ManagedPosition:
     # для масштабирования opposing_wall_min_profit_pct под текущий режим рынка
     # (см. _opposing_wall_exit) вместо одного фиксированного % на все случаи.
     entry_volatility_pct: float = 0.0
+    # Сколько раз ПОДРЯД последняя попытка закрытия (полного или TP1) не смогла
+    # исполниться целиком - см. _close_price/paper_cross_buffer_escalation_pct.
+    # Найдено в проде 18.08: без эскалации буфера позиция может "зависать" в
+    # закрытии на много минут, если верхушка книги тоньше размера позиции.
+    close_stall_count: int = 0
+    # Сколько из pos.plan.tp1_size уже реально закрыто по TP1 - раньше
+    # pos.tp1_done ставился в True сразу после ОДНОЙ попытки _partial_close,
+    # даже если она исполнилась частично или вообще на 0 (см. коммент у
+    # _watch_position) - тихо теряли профит-тейк на тонком стакане. Теперь
+    # TP1 считается выполненным только когда реально закрыт весь tp1_size.
+    tp1_filled: float = 0.0
 
 
 class OrderManager:
@@ -342,12 +353,23 @@ class OrderManager:
                 if not pos.tp1_done:
                     hit_tp1 = (price >= pos.plan.tp1_price) if pos.side == "long" else (price <= pos.plan.tp1_price)
                     if hit_tp1:
-                        await self._partial_close(pos, snap, pos.plan.tp1_size, "tp1")
-                        pos.tp1_done = True
-                        pos.trailing_active = True
-                        pos.trailing_extreme = price
-                        log.info("[%s] TP1 сработал, остаток переведён на трейлинг-стоп %.2f%%",
-                                  pos.symbol, pos.plan.trailing_stop_pct)
+                        # Раньше tp1_done ставился в True сразу после ОДНОЙ попытки,
+                        # даже если она исполнилась частично/на 0 (тонкий стакан) -
+                        # тихо теряли часть профит-тейка навсегда. Теперь запрашиваем
+                        # только незакрытый остаток tp1_size и подтверждаем TP1
+                        # только когда он реально закрыт целиком (см. pos.tp1_filled).
+                        remaining_tp1 = pos.plan.tp1_size - pos.tp1_filled
+                        filled_now = await self._partial_close(pos, snap, remaining_tp1, "tp1")
+                        pos.tp1_filled += filled_now
+                        if pos.tp1_filled >= pos.plan.tp1_size - 1e-6:
+                            pos.tp1_done = True
+                            pos.trailing_active = True
+                            pos.trailing_extreme = price
+                            log.info("[%s] TP1 сработал полностью, остаток переведён на трейлинг-стоп %.2f%%",
+                                      pos.symbol, pos.plan.trailing_stop_pct)
+                        else:
+                            log.warning("[%s] TP1 исполнился частично (%.6f из %.6f) - повторим остаток "
+                                        "на следующей проверке", pos.symbol, pos.tp1_filled, pos.plan.tp1_size)
 
                 if pos.trailing_active:
                     await self._update_trailing_stop(pos, price)
@@ -572,7 +594,7 @@ class OrderManager:
                                                  current_size, new_sl, exit_is_ask)
         log.info("[%s] трейлинг-стоп подтянут до %.2f (пик %.2f)", pos.symbol, new_sl, pos.trailing_extreme)
 
-    def _close_price(self, snap, exit_is_ask: bool, fallback_price: float) -> float:
+    def _close_price(self, snap, exit_is_ask: bool, fallback_price: float, stall_count: int = 0) -> float:
         """
         Цена для reduce-only закрывающего ордера. В paper-режиме PaperClient
         исполняет только IOC, пересекающие спред (см. _enter_with_chase) - пассивная
@@ -584,17 +606,33 @@ class OrderManager:
         складывался со следующим входом (наблюдалось: 2 входа по 0.046780 BTC
         дали 0.093560 к моменту следующего закрытия). В live-режиме буфер не
         нужен - там реальная книга и другой механизм исполнения.
+
+        stall_count - см. pos.close_stall_count. Базовый буфер гарантирует
+        пересечение СПРЕДА, но не гарантирует пересечение достаточной ГЛУБИНЫ
+        книги, если объём позиции больше того, что стоит на самой верхушке.
+        Найдено в проде 18.08: позиция ETH на 1.5788 не могла закрыться >3
+        минут - каждая попытка с одним и тем же крошечным буфером снова
+        исполнялась лишь на ~0.12 ETH. Эскалируем буфер с каждой неудачной
+        попыткой (шире буфер = глубже внутрь книги), чтобы закрытие в итоге
+        гарантированно прошло целиком, вместо неопределённо долгого зависания.
         """
         if CFG.mode != "paper" or snap is None:
             return fallback_price
         cross_price = snap.best_bid if exit_is_ask else snap.best_ask
-        buf = cross_price * CFG.paper_cross_buffer_pct / 100
+        buf_pct = min(
+            CFG.paper_cross_buffer_pct + stall_count * CFG.paper_cross_buffer_escalation_pct,
+            CFG.paper_cross_buffer_max_pct,
+        )
+        buf = cross_price * buf_pct / 100
         return (cross_price - buf) if exit_is_ask else (cross_price + buf)
 
-    async def _partial_close(self, pos: ManagedPosition, snap, size: float, reason: str):
+    async def _partial_close(self, pos: ManagedPosition, snap, size: float, reason: str) -> float:
+        """Возвращает фактически закрытый размер (0.0, если не исполнилось совсем) -
+        вызывающий код (TP1 в _watch_position) использует это, чтобы не считать
+        частичный/нулевой филл полным закрытием (см. pos.tp1_filled)."""
         exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
         fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
-        price = self._close_price(snap, exit_is_ask, fallback)
+        price = self._close_price(snap, exit_is_ask, fallback, pos.close_stall_count)
         exit_price = price
         filled = 0.0
         try:
@@ -609,15 +647,20 @@ class OrderManager:
                     exit_price = avg
         except Exception as e:
             log.error("[%s] частичное закрытие (%s) не удалось: %s", pos.symbol, reason, e)
-            return
+            return 0.0
 
         if filled <= 1e-9:
-            log.warning("[%s] частичное закрытие (%s): ордер не исполнился (0 из %.6f) - позиция НЕ уменьшена",
-                        pos.symbol, reason, size)
-            return
+            pos.close_stall_count += 1
+            log.warning("[%s] частичное закрытие (%s): ордер не исполнился (0 из %.6f) - позиция НЕ уменьшена "
+                        "(попытка %d подряд, буфер эскалирован)", pos.symbol, reason, size, pos.close_stall_count)
+            return 0.0
         if filled < size - 1e-9:
-            log.warning("[%s] частичное закрытие (%s): исполнилось только %.6f из запрошенных %.6f",
-                        pos.symbol, reason, filled, size)
+            pos.close_stall_count += 1
+            log.warning("[%s] частичное закрытие (%s): исполнилось только %.6f из запрошенных %.6f "
+                        "(попытка %d подряд, буфер эскалирован)",
+                        pos.symbol, reason, filled, size, pos.close_stall_count)
+        else:
+            pos.close_stall_count = 0
         size = filled
 
         direction = 1 if pos.side == "long" else -1
@@ -626,6 +669,7 @@ class OrderManager:
         pos.filled_size -= size
         self.risk.register_close(pos.symbol, pos.side, pnl)
         log.info("[%s] %s: закрыто %.6f по %.2f | PnL этой части=%.2f", pos.symbol, reason, size, exit_price, pnl)
+        return size
 
     async def _close_position_now(self, pos: ManagedPosition, snap, reason: str):
         try:
@@ -636,7 +680,7 @@ class OrderManager:
 
         exit_is_ask = pos.side == "long"
         fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
-        price = self._close_price(snap, exit_is_ask, fallback)
+        price = self._close_price(snap, exit_is_ask, fallback, pos.close_stall_count)
         exit_price = price
         closed_size = 0.0
         if current_size > 1e-9:
@@ -663,9 +707,16 @@ class OrderManager:
             # раньше) - НЕ считаем позицию закрытой и не убираем из self.positions,
             # иначе на бирже останется реальный "хвост", который тихо сложится со
             # следующим входом по этому же символу (см. комментарий в _close_price).
+            pos.close_stall_count += 1
+            escalated_buf_pct = min(
+                CFG.paper_cross_buffer_pct + pos.close_stall_count * CFG.paper_cross_buffer_escalation_pct,
+                CFG.paper_cross_buffer_max_pct,
+            )
             log.warning("[%s] закрытие позиции (%s): исполнилось %.6f из %.6f, остаток %.6f - "
-                        "позиция остаётся под наблюдением, повторим на следующей проверке",
-                        pos.symbol, reason, closed_size, current_size, remaining)
+                        "позиция остаётся под наблюдением, повторим на следующей проверке "
+                        "(попытка %d подряд, буфер эскалирован до %.3f%%)",
+                        pos.symbol, reason, closed_size, current_size, remaining,
+                        pos.close_stall_count, escalated_buf_pct)
             if closed_size > 1e-9:
                 direction = 1 if pos.side == "long" else -1
                 pnl = (exit_price - pos.avg_entry) * direction * closed_size
