@@ -287,7 +287,7 @@ async function resumeBot() {
   refresh();
 }
 async function resetAccount() {
-  if (!confirm('Сбросить счёт бота?\n\nБаланс вернётся к стартовому, все открытые позиции будут закрыты, а ВСЯ история сделок удалится безвозвратно. Это нельзя отменить.')) return;
+  if (!confirm('Сбросить счёт бота?\\n\\nБаланс вернётся к стартовому, все открытые позиции будут закрыты, а ВСЯ история сделок удалится безвозвратно. Это нельзя отменить.')) return;
   const r = await fetch('/api/reset_account', {method:'POST'});
   const j = await r.json().catch(() => ({}));
   if (!r.ok || j.ok === false) { alert('Не удалось сбросить счёт' + (j.error ? ': ' + j.error : '')); }
