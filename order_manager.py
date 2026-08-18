@@ -99,6 +99,10 @@ class OrderManager:
         # шлют закрывающий ордер и оба считают PnL/пишут в trade_log - на
         # практике это задвоило бы закрытие одной и той же сделки.
         self._close_locks: Dict[str, asyncio.Lock] = {}
+        # Когда символ последний раз закрывался watcher'ом (stop_loss/opposing_wall/
+        # structure_invalidated) - см. CFG.reentry_cooldown_sec в handle_signal.
+        # НЕ трогаем при reversal_signal - это отдельный, намеренный разворот.
+        self._last_close_ts: Dict[str, float] = {}
 
     def note_snapshot(self, snap):
         self._latest_snap[snap.symbol] = snap
@@ -187,6 +191,19 @@ class OrderManager:
                 # Ниже продолжаем этим же вызовом на вход в новую (развернутую)
                 # сторону - не ждём следующего независимого срабатывания сигнала,
                 # это и есть "сразу шортить", а не через один-два цикла проверки.
+            else:
+                # Кулдаун ТОЛЬКО для входа с нуля (existing был None) - см.
+                # CFG.reentry_cooldown_sec. Разворот выше (existing is not None)
+                # намеренно НЕ проверяется - это уже принятое решение "прямо
+                # сейчас развернуться", а не повторный вход после паузы.
+                last_close = self._last_close_ts.get(signal.symbol)
+                if last_close is not None:
+                    since = time.time() - last_close
+                    if since < CFG.reentry_cooldown_sec:
+                        log.info("[%s] вход пропущен: кулдаун после закрытия (%.0fs назад из %.0fs) - "
+                                  "не влезаем сразу обратно в тот же шум", signal.symbol, since,
+                                  CFG.reentry_cooldown_sec)
+                        return
 
             if not self.risk.can_trade():
                 return
@@ -732,6 +749,10 @@ class OrderManager:
         if self.trade_log and pos.trade_id is not None:
             self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, reason)
         self.positions.pop(pos.symbol, None)
+        if reason in ("stop_loss", "opposing_wall", "structure_invalidated"):
+            # НЕ трогаем при reversal_signal - см. CFG.reentry_cooldown_sec/
+            # комментарий у self._last_close_ts в __init__.
+            self._last_close_ts[pos.symbol] = time.time()
         log.info("[%s] позиция закрыта (%s): последний кусок %.6f по %.2f | PnL сделки суммарно=%.2f",
                   pos.symbol, reason, current_size, exit_price, pos.realized_pnl)
 
@@ -824,6 +845,63 @@ class OrderManager:
         if self.trade_log and pos.trade_id is not None:
             self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, f"kill_switch:{reason}")
         self.positions.pop(symbol, None)
+
+    # ------------------------------------------------------------------ #
+    # Сброс счёта бота с дашборда - "начать заново" без передеплоя на Render
+    # ------------------------------------------------------------------ #
+
+    async def reset_account(self, reason: str = "manual (dashboard)"):
+        """
+        Полный сброс "счёта" бота по кнопке с дашборда - баланс, открытые
+        позиции и вся история сделок обнуляются, как при холодном старте
+        процесса, но без самого рестарта (значит, без разрыва WS Lighter/
+        Binance и простоя на пересборку - см. фикс переподключения в
+        market_data.py). Доступно ТОЛЬКО в paper-режиме (см. проверку ниже и
+        в Dashboard.handle_reset_account) - у live своя реальная биржа со
+        своими реальными деньгами, "сбросить баланс" там не бывает.
+
+        Порядок важен:
+          1. Сначала принудительно закрываем все открытые позиции (тот же
+             путь, что и kill switch - лок по символу + перепроверка, см.
+             flatten_all/_flatten_one) - нельзя обнулять equity/историю, пока
+             на "бирже" ещё висит реальный (пусть и виртуальный) риск.
+          2. Пересоздаём PaperClient - у него собственный внутренний баланс,
+             отдельный от RiskManager.equity, простым обнулением одних чисел
+             в этом классе paper-счёт не сбросить (см. exchange_client.py).
+          3. Обнуляем RiskManager (equity, дневной старт, серия убытков) и
+             TradeLog (история сделок, на которой считается win-rate/график
+             на дашборде).
+          4. Если был активен kill switch - снимаем, "чистый лист" не должен
+             начинаться с заблокированных входов.
+        """
+        if CFG.mode != "paper":
+            log.warning("Сброс счёта запрошен (%s), но MODE=%s - доступно только в paper", reason, CFG.mode)
+            return
+
+        for t in self._watchers.values():
+            t.cancel()
+        self._watchers.clear()
+
+        for symbol, pos in list(self.positions.items()):
+            async with self._get_close_lock(symbol):
+                if self.positions.get(symbol) is not pos:
+                    continue
+                await self._flatten_one(symbol, pos, reason)
+
+        await self.exchange.reset_paper_account()
+
+        self.risk.reset()
+        if self.trade_log:
+            self.trade_log.reset()
+
+        self._last_close_ts.clear()
+        self._entering.clear()
+
+        if self.kill_switch and self.kill_switch.active:
+            self.kill_switch.reset()
+
+        log.warning("СЧЁТ СБРОШЕН (%s): баланс -> $%.2f, позиции и история сделок обнулены.",
+                    reason, CFG.account_equity_usd)
 
     async def shutdown(self):
         for t in self._watchers.values():
