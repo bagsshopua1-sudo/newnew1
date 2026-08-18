@@ -48,6 +48,12 @@ class Wall:
     usd: float
     side: str  # "bid" | "ask"
     distance_pct: float
+    # Сколько USD стоит ЗА этой стенкой (глубже в стакане, в сторону от mid),
+    # в пределах CFG.wall_backup_range_pct от её цены - т.е. есть ли у стенки
+    # "подложка", или она одиночная и за ней почти пусто. Крупная стенка без
+    # подложки может не удержать цену, если через неё реально начнут идти
+    # (см. signals.py, где это используется как фильтр для ABSORPTION-сигналов).
+    backup_usd: float = 0.0
     first_seen: float = field(default_factory=time.time)
 
 
@@ -67,7 +73,8 @@ class BookSnapshot:
 
 
 def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tuple],
-                  wall_min_usd: float, wall_max_distance_pct: float) -> Optional[BookSnapshot]:
+                  wall_min_usd: float, wall_max_distance_pct: float,
+                  wall_backup_range_pct: float = 0.3) -> Optional[BookSnapshot]:
     """
     Общий анализ стакана (стенки + дисбаланс) - не привязан к конкретной бирже.
     bids/asks - списки (price: float, size: float), в любом порядке (сортируем сами).
@@ -85,14 +92,25 @@ def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tupl
         return None
 
     max_dist = wall_max_distance_pct / 100.0
+    backup_range = wall_backup_range_pct / 100.0
 
     def find_walls(levels, side):
         walls = []
-        for price, size in levels:
+        for idx, (price, size) in enumerate(levels):
             usd = price * size
             dist = abs(price - mid) / mid
             if usd >= wall_min_usd and dist <= max_dist:
-                walls.append(Wall(price=price, size=size, usd=usd, side=side, distance_pct=dist * 100))
+                # Подложка за стенкой: levels отсортирован по удалению от mid
+                # (bids - по убыванию цены, asks - по возрастанию), поэтому всё,
+                # что идёт ПОСЛЕ текущего уровня в списке, глубже в стакане -
+                # то есть именно "за" этой стенкой, а не перед ней.
+                backup_usd = 0.0
+                for p2, s2 in levels[idx + 1:]:
+                    if abs(p2 - price) / price > backup_range:
+                        break
+                    backup_usd += p2 * s2
+                walls.append(Wall(price=price, size=size, usd=usd, side=side,
+                                   distance_pct=dist * 100, backup_usd=backup_usd))
         return walls
 
     bid_walls = find_walls(bids, "bid")
@@ -150,7 +168,7 @@ class MarketData:
         bids = [(float(o["price"]), float(o["size"])) for o in book.get("bids", [])]
         asks = [(float(o["price"]), float(o["size"])) for o in book.get("asks", [])]
         return analyze_book(market.symbol, str(market.market_index), bids, asks,
-                             CFG.wall_min_usd, CFG.wall_max_distance_pct)
+                             CFG.wall_min_usd, CFG.wall_max_distance_pct, CFG.wall_backup_range_pct)
 
     # ------------------------------------------------------------------ #
 
