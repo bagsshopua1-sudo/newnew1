@@ -248,7 +248,8 @@ class OrderManager:
                 return
 
             plan = self.risk.build_plan(signal.symbol, signal.side, signal.mid,
-                                         wall_price=signal.reference_price)
+                                         wall_price=signal.reference_price,
+                                         wall_usd=signal.wall_usd, backup_usd=signal.backup_usd)
             if plan.size <= 0 or plan.size < market.min_base_amount:
                 log.warning("[%s] расчётный размер позиции %.6f меньше минимального лота, сигнал пропущен",
                             signal.symbol, plan.size)
