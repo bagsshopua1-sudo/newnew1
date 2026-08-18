@@ -146,6 +146,39 @@ class RiskManager:
             trailing_stop_pct=CFG.trailing_stop_pct,
         )
 
+    def rebase_plan_to_fill(self, plan: TradePlan, actual_entry_price: float) -> TradePlan:
+        """
+        build_plan() считает entry_price/stop/TP1 от цены сигнала (signal.mid,
+        Binance) - но это делается ДО реального входа. Настоящее исполнение
+        происходит на Lighter и почти всегда отличается: basis Binance/Lighter,
+        плюс между сигналом и фактической отправкой ордера проходит время
+        (задержка сети, реприсинг), за которое цена успевает сдвинуться. На
+        практике это давало SL/TP, привязанные к точке, где сделка на самом деле
+        не открывалась (наблюдалось расхождение $24-33 при цене ~64200, то есть
+        сделка стартовала уже "просевшей" относительно расчётной структуры и
+        _thesis_invalidated срабатывал почти сразу).
+        Пересчитываем SL/TP от РЕАЛЬНОЙ цены входа, сохраняя ту же дистанцию (в
+        цене), которая уже была посчитана от структуры сигнала - size не трогаем,
+        он уже определяет фактический риск в USD от исходного risk_per_trade_pct.
+        """
+        stop_distance = abs(plan.entry_price - plan.stop_price)
+        tp1_distance = abs(plan.tp1_price - plan.entry_price)
+        if plan.side == "long":
+            new_stop = actual_entry_price - stop_distance
+            new_tp1 = actual_entry_price + tp1_distance
+        else:
+            new_stop = actual_entry_price + stop_distance
+            new_tp1 = actual_entry_price - tp1_distance
+        if abs(actual_entry_price - plan.entry_price) > plan.entry_price * 0.02 / 100:
+            log.info("[%s] SL/TP пересчитаны от реальной цены входа %.2f (план был от %.2f, "
+                      "расхождение %.2f) -> SL=%.2f TP1=%.2f",
+                      plan.symbol, actual_entry_price, plan.entry_price,
+                      actual_entry_price - plan.entry_price, new_stop, new_tp1)
+        plan.entry_price = actual_entry_price
+        plan.stop_price = new_stop
+        plan.tp1_price = new_tp1
+        return plan
+
     def register_close(self, symbol: str, side: str, pnl_usd: float):
         self.equity += pnl_usd
         self.closed_trades.append(ClosedTrade(symbol=symbol, side=side, pnl_usd=pnl_usd))
