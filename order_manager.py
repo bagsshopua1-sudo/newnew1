@@ -243,7 +243,12 @@ class OrderManager:
                 hit_stop = (price <= pos.current_sl_price) if pos.side == "long" else (price >= pos.current_sl_price)
                 if hit_stop:
                     await self._close_position_now(pos, snap, "stop_loss")
-                    return
+                    if not self.has_position(pos.symbol):
+                        return
+                    # закрывающий ордер исполнился не полностью (paper: не пересёк
+                    # спред) - позиция всё ещё числится открытой, пробуем закрыть
+                    # остаток на следующем тике вместо того чтобы бросить слежение.
+                    continue
 
                 if not pos.tp1_done:
                     hit_tp1 = (price >= pos.plan.tp1_price) if pos.side == "long" else (price <= pos.plan.tp1_price)
@@ -264,7 +269,9 @@ class OrderManager:
                 if time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and \
                         self._thesis_invalidated(pos, signal_snap):
                     await self._close_position_now(pos, snap, "structure_invalidated")
-                    return
+                    if not self.has_position(pos.symbol):
+                        return
+                    continue
 
         except asyncio.CancelledError:
             return
@@ -339,29 +346,58 @@ class OrderManager:
                                                  current_size, new_sl, exit_is_ask)
         log.info("[%s] трейлинг-стоп подтянут до %.2f (пик %.2f)", pos.symbol, new_sl, pos.trailing_extreme)
 
+    def _close_price(self, snap, exit_is_ask: bool, fallback_price: float) -> float:
+        """
+        Цена для reduce-only закрывающего ордера. В paper-режиме PaperClient
+        исполняет только IOC, пересекающие спред (см. _enter_with_chase) - пассивная
+        цена (голый best_bid/best_ask) часто НЕ пересекает книгу гарантированно
+        (округления/рассинхрон снепшота), и ордер исполняется частично или вообще
+        не исполняется. Раньше это делалось без буфера - в проде это привело к
+        тому, что позиция считалась закрытой (мы её убирали из self.positions),
+        а на самом paper-аккаунте оставался непогашенный остаток, который затем
+        складывался со следующим входом (наблюдалось: 2 входа по 0.046780 BTC
+        дали 0.093560 к моменту следующего закрытия). В live-режиме буфер не
+        нужен - там реальная книга и другой механизм исполнения.
+        """
+        if CFG.mode != "paper" or snap is None:
+            return fallback_price
+        cross_price = snap.best_bid if exit_is_ask else snap.best_ask
+        buf = cross_price * CFG.paper_cross_buffer_pct / 100
+        return (cross_price - buf) if exit_is_ask else (cross_price + buf)
+
     async def _partial_close(self, pos: ManagedPosition, snap, size: float, reason: str):
         exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
-        price = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+        fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+        price = self._close_price(snap, exit_is_ask, fallback)
         exit_price = price
+        filled = 0.0
         try:
             result, _, _ = await self.exchange.place_limit_order(
                 pos.market, next_client_order_index(), size, price, exit_is_ask,
                 reduce_only=True, post_only=False,
             )
             if result is not None:
-                filled = getattr(result, "filled_size", None)
+                filled = getattr(result, "filled_size", 0.0) or 0.0
                 avg = getattr(result, "avg_price", None)
-                if filled:
-                    size = filled
                 if avg:
                     exit_price = avg
         except Exception as e:
             log.error("[%s] частичное закрытие (%s) не удалось: %s", pos.symbol, reason, e)
             return
 
+        if filled <= 1e-9:
+            log.warning("[%s] частичное закрытие (%s): ордер не исполнился (0 из %.6f) - позиция НЕ уменьшена",
+                        pos.symbol, reason, size)
+            return
+        if filled < size - 1e-9:
+            log.warning("[%s] частичное закрытие (%s): исполнилось только %.6f из запрошенных %.6f",
+                        pos.symbol, reason, filled, size)
+        size = filled
+
         direction = 1 if pos.side == "long" else -1
         pnl = (exit_price - pos.avg_entry) * direction * size
         pos.realized_pnl += pnl
+        pos.filled_size -= size
         self.risk.register_close(pos.symbol, pos.side, pnl)
         log.info("[%s] %s: закрыто %.6f по %.2f | PnL этой части=%.2f", pos.symbol, reason, size, exit_price, pnl)
 
@@ -373,8 +409,10 @@ class OrderManager:
         current_size = abs(live_pos["size"]) if live_pos else 0.0
 
         exit_is_ask = pos.side == "long"
-        price = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+        fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+        price = self._close_price(snap, exit_is_ask, fallback)
         exit_price = price
+        closed_size = 0.0
         if current_size > 1e-9:
             try:
                 result, _, _ = await self.exchange.place_limit_order(
@@ -382,11 +420,33 @@ class OrderManager:
                     reduce_only=True, post_only=False,
                 )
                 if result is not None:
+                    closed_size = getattr(result, "filled_size", 0.0) or 0.0
                     avg = getattr(result, "avg_price", None)
                     if avg:
                         exit_price = avg
+                elif CFG.mode != "paper":
+                    # live: результат ордера не возвращается синхронно тем же способом -
+                    # считаем закрытым весь запрошенный размер (как и раньше).
+                    closed_size = current_size
             except Exception as e:
                 log.error("[%s] закрытие позиции (%s) не удалось: %s", pos.symbol, reason, e)
+
+        remaining = current_size - closed_size
+        if remaining > 1e-9:
+            # Не исполнилось полностью (частый случай для paper без кросс-буфера
+            # раньше) - НЕ считаем позицию закрытой и не убираем из self.positions,
+            # иначе на бирже останется реальный "хвост", который тихо сложится со
+            # следующим входом по этому же символу (см. комментарий в _close_price).
+            log.warning("[%s] закрытие позиции (%s): исполнилось %.6f из %.6f, остаток %.6f - "
+                        "позиция остаётся под наблюдением, повторим на следующей проверке",
+                        pos.symbol, reason, closed_size, current_size, remaining)
+            if closed_size > 1e-9:
+                direction = 1 if pos.side == "long" else -1
+                pnl = (exit_price - pos.avg_entry) * direction * closed_size
+                pos.realized_pnl += pnl
+                self.risk.register_close(pos.symbol, pos.side, pnl)
+            pos.filled_size = remaining
+            return
 
         direction = 1 if pos.side == "long" else -1
         pnl = (exit_price - pos.avg_entry) * direction * current_size
@@ -432,8 +492,12 @@ class OrderManager:
             if size > 1e-9:
                 exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
                 snap = self._latest_snap.get(symbol)
-                # закрываемся агрессивно (навстречу лучшей цене), не post-only - это аварийный выход
-                price = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+                # закрываемся агрессивно (навстречу лучшей цене), не post-only - это аварийный выход.
+                # В paper дополнительно пересекаем спред с буфером (см. _close_price) -
+                # без этого reduce-only IOC мог не исполниться, и аварийное закрытие
+                # оставляло бы реальный хвост на бирже, хотя мы считали его закрытым.
+                fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+                price = self._close_price(snap, exit_is_ask, fallback)
                 try:
                     result, _, _ = await self.exchange.place_limit_order(
                         pos.market, next_client_order_index(), size, price, exit_is_ask,
