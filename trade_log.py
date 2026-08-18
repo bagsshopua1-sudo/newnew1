@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 """
 
+# mfe_pct/mae_pct (max favorable / max adverse excursion, в % от entry, по
+# ходу всей сделки) добавлены 18.08 (аудит стратегии, этап 1) - нужны, чтобы
+# отличать "стоп сработал ровно там, где сделка и должна была закрыться" от
+# "сделка была в плюсе X%, но выход упустил это и закрыл хуже" - без этого
+# по TradeLog нельзя было измерить, сколько потенциала теряется на плохом
+# таймингe выхода (см. AUDIT_2026-08-18.md). Через ALTER TABLE, а не в
+# основной SCHEMA - на проде уже есть таблица trades без этих колонок,
+# CREATE TABLE IF NOT EXISTS её не тронет.
+_MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN mfe_pct REAL",
+    "ALTER TABLE trades ADD COLUMN mae_pct REAL",
+]
+
 
 @dataclass
 class TradeRecord:
@@ -40,6 +53,8 @@ class TradeRecord:
     closed_at: Optional[float]
     close_reason: Optional[str]
     signal_type: Optional[str]
+    mfe_pct: Optional[float] = None
+    mae_pct: Optional[float] = None
 
 
 class TradeLog:
@@ -48,6 +63,12 @@ class TradeLog:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute(SCHEMA)
         self.conn.commit()
+        for stmt in _MIGRATIONS:
+            try:
+                self.conn.execute(stmt)
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть (не первый холодный старт после этого апдейта)
 
     def open_trade(self, symbol: str, side: str, entry_price: float, size: float, signal_type: str) -> int:
         cur = self.conn.execute(
@@ -57,17 +78,18 @@ class TradeLog:
         self.conn.commit()
         return cur.lastrowid
 
-    def close_trade(self, trade_id: int, exit_price: float, pnl_usd: float, reason: str):
+    def close_trade(self, trade_id: int, exit_price: float, pnl_usd: float, reason: str,
+                     mfe_pct: Optional[float] = None, mae_pct: Optional[float] = None):
         self.conn.execute(
-            "UPDATE trades SET exit_price=?, pnl_usd=?, closed_at=?, close_reason=? WHERE id=?",
-            (exit_price, pnl_usd, time.time(), reason, trade_id),
+            "UPDATE trades SET exit_price=?, pnl_usd=?, closed_at=?, close_reason=?, mfe_pct=?, mae_pct=? WHERE id=?",
+            (exit_price, pnl_usd, time.time(), reason, mfe_pct, mae_pct, trade_id),
         )
         self.conn.commit()
 
     def recent(self, limit: int = 50) -> List[TradeRecord]:
         rows = self.conn.execute(
-            "SELECT id,symbol,side,entry_price,exit_price,size,pnl_usd,opened_at,closed_at,close_reason,signal_type "
-            "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT id,symbol,side,entry_price,exit_price,size,pnl_usd,opened_at,closed_at,close_reason,"
+            "signal_type,mfe_pct,mae_pct FROM trades ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [TradeRecord(*r) for r in rows]
 
