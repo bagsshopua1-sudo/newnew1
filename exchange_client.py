@@ -275,3 +275,41 @@ class ExchangeClient:
         if self.paper:
             await self.paper.close()
         await self.api_client.close()
+
+    async def reset_paper_account(self):
+        """
+        Сброс "счёта" бота в paper-режиме по запросу с дашборда - см.
+        Dashboard.handle_reset_account / OrderManager.reset_account.
+        lighter.PaperClient хранит СВОЙ ВНУТРЕННИЙ баланс/позиции отдельно от
+        RiskManager.equity (тот - только для расчёта размера позиции и показа
+        на дашборде) - обнулить его можно только пересозданием клиента, метода
+        "сбросить баланс" у самого PaperClient нет. Раньше единственным
+        способом сбросить paper-счёт был полный рестарт процесса на Render
+        (см. комментарий "paper equity/positions wiped on every restart") -
+        это тянуло за собой разрыв WS Lighter и Binance, простой на пересборку
+        и т.д. Здесь делаем то же самое, но без рестарта всего бота.
+        """
+        if CFG.mode != "paper" or self.paper is None:
+            return
+        raw_ws_url = self.endpoint.ws_url
+        sep = "&" if "?" in raw_ws_url else "?"
+        paper_ws_url = f"{raw_ws_url}{sep}encoding=json"
+        new_paper = lighter.PaperClient(
+            api_client=self.api_client,
+            initial_collateral_usdc=CFG.account_equity_usd,
+            order_api=self.order_api,
+            ws_url=paper_ws_url,
+        )
+        # Трекаем рынки на НОВОМ клиенте ДО подмены self.paper - иначе в окне
+        # между подменой и track_market() любой параллельный вызов
+        # get_position/create_paper_order упадёт с "market not tracked".
+        for market in self.markets.values():
+            await new_paper.track_market(market.market_index)
+        old_paper = self.paper
+        self.paper = new_paper
+        try:
+            await old_paper.close()
+        except Exception as e:
+            log.warning("Не удалось корректно закрыть старый PaperClient при сбросе счёта: %s", e)
+        log.warning("Paper-счёт пересоздан: баланс сброшен до $%.2f, все виртуальные позиции обнулены.",
+                    CFG.account_equity_usd)
