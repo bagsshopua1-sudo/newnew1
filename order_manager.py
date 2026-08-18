@@ -354,6 +354,24 @@ class OrderManager:
         if snap is None or not pos.reference_price:
             return False
 
+        # Сравнение силы стенок - НЕ завязано на signal_type и НЕ завязано на
+        # % прибыли (в отличие от _opposing_wall_exit ниже). Логика напрямую
+        # от пользователя: "если лонг идёт хорошо вверх и упирается в стенку
+        # 1кк, а сейчас держит цену стенка всего 200к - надо выходить, так как
+        # 1кк сильнее 200к". Берём ближайшую к цене стенку с каждой стороны -
+        # именно она реально "держит"/"блокирует" цену прямо сейчас, а не
+        # самая крупная стенка где-то далеко в стакане. Если стенки, которая
+        # держит движение, вообще нет (0) - это ещё хуже, чем слабая: любая
+        # блокирующая стенка тогда считается доминирующей.
+        blocking_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
+        holding_walls = snap.bid_walls if pos.side == "long" else snap.ask_walls
+        if blocking_walls:
+            nearest_blocking = min(blocking_walls, key=lambda w: w.distance_pct)
+            nearest_holding = min(holding_walls, key=lambda w: w.distance_pct) if holding_walls else None
+            holding_usd = nearest_holding.usd if nearest_holding else 0.0
+            if nearest_blocking.usd >= holding_usd * CFG.wall_dominance_ratio:
+                return True
+
         if pos.signal_type == "absorption":
             # Тезис: стенка держится и её ещё не пробили. Инвалидация - стенка
             # исчезла с той стороны, от которой фейдили, И цена уже прошла её
@@ -422,20 +440,38 @@ class OrderManager:
         basis Binance/Lighter (наблюдался ~0.02%) искажает расчёт "в прибыли ли
         мы вообще", хоть и на небольшую величину. Структуру (встречную стенку)
         по-прежнему берём с Binance - там стакан глубже.
+
+        ВАЖНО #3: порог прибыли не одинаковый для любой встречной стенки. Если
+        стенка стоит ПРЯМО у цены (в пределах OPPOSING_WALL_CLOSE_DISTANCE_PCT) -
+        это более срочный сигнал (цена уже физически упёрлась в неё), и порог
+        снижается до OPPOSING_WALL_CLOSE_MIN_PROFIT_PCT. Для дальней стенки
+        (0.2-0.3% и дальше) порог остаётся обычным effective_min_profit_pct -
+        риск, что до неё вообще дойдёт, ниже, спешить закрываться незачем.
+        Пониженный порог всё равно НЕ уходит ниже round-trip издержек на
+        проскальзывание - иначе это снова гарантированный убыток после входа/
+        выхода, ровно та регрессия, из-за которой появился минимальный порог
+        прибыли изначально (см. комментарий в config.py).
         """
         if signal_snap is None or exec_snap is None:
             return False
+        # для лонга встречная стенка - на продажу (ask), для шорта - на покупку (bid)
+        opposing_walls = signal_snap.ask_walls if pos.side == "long" else signal_snap.bid_walls
+        if not opposing_walls:
+            return False
+
         effective_min_profit_pct = max(
             CFG.opposing_wall_min_profit_pct,
             pos.entry_volatility_pct * CFG.opposing_wall_vol_multiplier,
         )
+        nearest_distance_pct = min(w.distance_pct for w in opposing_walls)
+        if nearest_distance_pct <= CFG.opposing_wall_close_distance_pct:
+            # стенка "в упор" - используем пониженный порог, но не задираем его
+            # обратно вверх, если обычный порог и так был ниже (волатильность)
+            effective_min_profit_pct = min(effective_min_profit_pct, CFG.opposing_wall_close_min_profit_pct)
+
         profit_pct = ((exec_snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
             else ((pos.avg_entry - exec_snap.mid) / pos.avg_entry * 100)
-        if profit_pct < effective_min_profit_pct:
-            return False
-        # для лонга встречная стенка - на продажу (ask), для шорта - на покупку (bid)
-        opposing_walls = signal_snap.ask_walls if pos.side == "long" else signal_snap.bid_walls
-        return len(opposing_walls) > 0
+        return profit_pct >= effective_min_profit_pct
 
     async def _update_trailing_stop(self, pos: ManagedPosition, price: float):
         improved = False
