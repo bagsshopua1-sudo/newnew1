@@ -79,6 +79,15 @@ class OrderManager:
         # регистрацией позиции есть await, поэтому has_position() одна не спасает
         # от гонки, если за это время прилетит ещё один сигнал по тому же символу).
         self._entering: set = set()
+        # Лок на закрытие ПОЗИЦИИ по символу. Закрыть позицию могут ДВА разных
+        # независимых источника одновременно: фоновый _watch_position (стоп/
+        # тейк/встречная стенка/развал структуры) и handle_signal (немедленное
+        # закрытие при развороте сигнала). Оба вызывают _close_position_now по
+        # своему расписанию - без лока возможна гонка: оба читают позицию как
+        # ещё открытую (ни один не успел её убрать из self.positions), оба
+        # шлют закрывающий ордер и оба считают PnL/пишут в trade_log - на
+        # практике это задвоило бы закрытие одной и той же сделки.
+        self._close_locks: Dict[str, asyncio.Lock] = {}
 
     def note_snapshot(self, snap):
         self._latest_snap[snap.symbol] = snap
@@ -88,6 +97,26 @@ class OrderManager:
 
     def has_position(self, symbol: str) -> bool:
         return symbol in self.positions
+
+    def _get_close_lock(self, symbol: str) -> asyncio.Lock:
+        lock = self._close_locks.get(symbol)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._close_locks[symbol] = lock
+        return lock
+
+    async def _close_position_safely(self, pos: ManagedPosition, snap, reason: str):
+        """
+        Обёртка над _close_position_now с локом по символу + перепроверкой
+        после его получения - см. комментарий у self._close_locks в __init__.
+        Пока ждали лок, позицию мог уже закрыть параллельный вызов (из
+        _watch_position или из handle_signal) - если self.positions[symbol]
+        больше не тот же самый объект pos, закрывать уже нечего.
+        """
+        async with self._get_close_lock(pos.symbol):
+            if self.positions.get(pos.symbol) is not pos:
+                return
+            await self._close_position_now(pos, snap, reason)
 
     # ------------------------------------------------------------------ #
     # Вход в позицию с "чейзингом" лимитки
@@ -100,51 +129,64 @@ class OrderManager:
             log.debug("[%s] вход уже в процессе, сигнал пропущен", signal.symbol)
             return
 
-        existing = self.positions.get(signal.symbol)
-        if existing is not None:
-            if existing.side == signal.side:
-                log.debug("[%s] уже есть открытая позиция в ту же сторону, сигнал пропущен", signal.symbol)
-                return
-            # Свежий сигнал ПРОТИВ открытой позиции (новая стенка/пробой с
-            # противоположной стороны) - это не шум, а реальный сдвиг структуры
-            # рынка. Раньше такой сигнал молча отбрасывался (has_position() ->
-            # return), и позиция ждала своих штатных условий выхода (стоп/тейк/
-            # thesis_invalidated с INVALIDATION_CONFIRM_TICKS подтверждениями) -
-            # жалоба пользователя: "после лонга надо сразу шортить, а оно стоит,
-            # потом цена падает и закрывает в минус". Закрываем НЕМЕДЛЕННО по
-            # рынку, без debounce (как и _opposing_wall_exit) - раз структура
-            # уже развернулась, ждать нет смысла, только отдаём движение.
-            log.info("[%s] РАЗВОРОТ: сигнал %s (%s) против открытой позиции %s - закрываем немедленно",
-                      signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
-            snap = self._latest_snap.get(signal.symbol)
-            await self._close_position_now(existing, snap, "reversal_signal")
-            if self.has_position(signal.symbol):
-                # Закрытие исполнилось не полностью (paper: не пересекло спред) -
-                # остаток всё ещё числится открытым, новую позицию поверх не
-                # открываем, следующий тик _watch_position дозакроет хвост.
-                return
-            watcher = self._watchers.pop(signal.symbol, None)
-            if watcher:
-                watcher.cancel()
-            # Ниже продолжаем этим же вызовом на вход в новую (развернутую)
-            # сторону - не ждём следующего независимого срабатывания сигнала,
-            # это и есть "сразу шортить", а не через один-два цикла проверки.
-
-        if not self.risk.can_trade():
-            return
-
-        plan = self.risk.build_plan(signal.symbol, signal.side, signal.mid,
-                                     wall_price=signal.reference_price)
-        if plan.size <= 0 or plan.size < market.min_base_amount:
-            log.warning("[%s] расчётный размер позиции %.6f меньше минимального лота, сигнал пропущен",
-                        signal.symbol, plan.size)
-            return
-
-        # Синхронно (без await между проверкой и пометкой) резервируем символ,
-        # чтобы параллельный сигнал по нему не начал второй вход, пока этот ждёт
-        # исполнения лимитки.
+        # Резервируем символ СИНХРОННО (без await между проверкой выше и этой
+        # строкой), ДО первого await ниже - и держим резерв на всю обработку
+        # сигнала, включая ветку разворота, а не только вход в новую позицию.
+        # Раньше резервирование стояло только перед входом в НОВУЮ позицию (см.
+        # ниже) - ветка разворота (закрыть текущую и тут же открыть
+        # противоположную) не была защищена вообще. В проде (см. лог-спам,
+        # разобранный в signals.py) один и тот же сигнал мог порождать
+        # НЕСКОЛЬКО параллельных asyncio-задач handle_signal почти одновременно
+        # - каждая из них видела ОДНУ И ТУ ЖЕ открытую позицию (ещё не
+        # закрытую, т.к. закрытие через await), и каждая пыталась независимо
+        # её закрыть/переоткрыть - гонка, которая могла задвоить закрытие
+        # (дважды посчитанный PnL в trade_log/risk) и/или открытие новой
+        # позиции. Резерв на весь вызов полностью сериализует обработку
+        # сигналов по одному символу - вторая параллельная задача теперь всегда
+        # уходит через проверку self._entering выше, ДО того как коснётся
+        # self.positions.
         self._entering.add(signal.symbol)
         try:
+            existing = self.positions.get(signal.symbol)
+            if existing is not None:
+                if existing.side == signal.side:
+                    log.debug("[%s] уже есть открытая позиция в ту же сторону, сигнал пропущен", signal.symbol)
+                    return
+                # Свежий сигнал ПРОТИВ открытой позиции (новая стенка/пробой с
+                # противоположной стороны) - это не шум, а реальный сдвиг структуры
+                # рынка. Раньше такой сигнал молча отбрасывался (has_position() ->
+                # return), и позиция ждала своих штатных условий выхода (стоп/тейк/
+                # thesis_invalidated с INVALIDATION_CONFIRM_TICKS подтверждениями) -
+                # жалоба пользователя: "после лонга надо сразу шортить, а оно стоит,
+                # потом цена падает и закрывает в минус". Закрываем НЕМЕДЛЕННО по
+                # рынку, без debounce (как и _opposing_wall_exit) - раз структура
+                # уже развернулась, ждать нет смысла, только отдаём движение.
+                log.info("[%s] РАЗВОРОТ: сигнал %s (%s) против открытой позиции %s - закрываем немедленно",
+                          signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
+                snap = self._latest_snap.get(signal.symbol)
+                await self._close_position_safely(existing, snap, "reversal_signal")
+                if self.has_position(signal.symbol):
+                    # Закрытие исполнилось не полностью (paper: не пересекло спред) -
+                    # остаток всё ещё числится открытым, новую позицию поверх не
+                    # открываем, следующий тик _watch_position дозакроет хвост.
+                    return
+                watcher = self._watchers.pop(signal.symbol, None)
+                if watcher:
+                    watcher.cancel()
+                # Ниже продолжаем этим же вызовом на вход в новую (развернутую)
+                # сторону - не ждём следующего независимого срабатывания сигнала,
+                # это и есть "сразу шортить", а не через один-два цикла проверки.
+
+            if not self.risk.can_trade():
+                return
+
+            plan = self.risk.build_plan(signal.symbol, signal.side, signal.mid,
+                                         wall_price=signal.reference_price)
+            if plan.size <= 0 or plan.size < market.min_base_amount:
+                log.warning("[%s] расчётный размер позиции %.6f меньше минимального лота, сигнал пропущен",
+                            signal.symbol, plan.size)
+                return
+
             filled_size, avg_entry = await self._enter_with_chase(market, plan)
             if filled_size <= 0:
                 log.info("[%s] вход не удался (лимитка не исполнилась за %d попыток)",
@@ -289,7 +331,7 @@ class OrderManager:
 
                 hit_stop = (price <= pos.current_sl_price) if pos.side == "long" else (price >= pos.current_sl_price)
                 if hit_stop:
-                    await self._close_position_now(pos, snap, "stop_loss")
+                    await self._close_position_safely(pos, snap, "stop_loss")
                     if not self.has_position(pos.symbol):
                         return
                     # закрывающий ордер исполнился не полностью (paper: не пересёк
@@ -320,7 +362,7 @@ class OrderManager:
                 # откатить обратно и прибыль превращается в убыток (см. коммент к
                 # OPPOSING_WALL_MIN_PROFIT_PCT в config.py - именно так и было в проде).
                 if self._opposing_wall_exit(pos, signal_snap, snap):
-                    await self._close_position_now(pos, snap, "opposing_wall")
+                    await self._close_position_safely(pos, snap, "opposing_wall")
                     if not self.has_position(pos.symbol):
                         return
                     pos.invalidation_streak = 0
@@ -337,7 +379,7 @@ class OrderManager:
                     pos.invalidation_streak = 0
 
                 if pos.invalidation_streak >= CFG.invalidation_confirm_ticks:
-                    await self._close_position_now(pos, snap, "structure_invalidated")
+                    await self._close_position_safely(pos, snap, "structure_invalidated")
                     if not self.has_position(pos.symbol):
                         return
                     pos.invalidation_streak = 0
@@ -639,57 +681,72 @@ class OrderManager:
             except Exception as e:
                 log.error("Не удалось массово отменить ордера: %s", e)
 
-        for symbol, pos in list(self.positions.items()):
-            try:
-                live_pos = await self.exchange.get_position(pos.market)
-            except Exception:
-                live_pos = None
-            size = abs(live_pos["size"]) if live_pos else pos.filled_size
-
-            exit_price = None
-            if size > 1e-9:
-                exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
-                snap = self._latest_snap.get(symbol)
-                # закрываемся агрессивно (навстречу лучшей цене), не post-only - это аварийный выход.
-                # В paper дополнительно пересекаем спред с буфером (см. _close_price) -
-                # без этого reduce-only IOC мог не исполниться, и аварийное закрытие
-                # оставляло бы реальный хвост на бирже, хотя мы считали его закрытым.
-                fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
-                price = self._close_price(snap, exit_is_ask, fallback)
-                try:
-                    result, _, _ = await self.exchange.place_limit_order(
-                        pos.market, next_client_order_index(), size, price, exit_is_ask,
-                        reduce_only=True, post_only=False,
-                    )
-                    avg = getattr(result, "avg_price", None) if result is not None else None
-                    exit_price = avg or price
-                except Exception as e:
-                    log.error("[%s] не удалось закрыть позицию при kill switch: %s", symbol, e)
-
-            # Итоговый PnL сделки = уже накопленное по прошлым частичным закрытиям
-            # (TP1 и т.п., см. pos.realized_pnl) + PnL последнего закрытого куска
-            # здесь. Не используем _estimate_closed_pnl.pnl напрямую - он посчитан
-            # от pos.filled_size (весь исходный размер), что задвоило бы PnL для
-            # позиций, у которых TP1 уже сработал до kill switch.
-            if exit_price is None:
-                _, exit_price = self._estimate_closed_pnl(pos)
-            chunk_pnl = 0.0
-            if size > 1e-9:
-                direction = 1 if pos.side == "long" else -1
-                chunk_pnl = (exit_price - pos.avg_entry) * direction * size
-                pos.realized_pnl += chunk_pnl
-            # equity двигаем только на PnL ИМЕННО этого (последнего) куска - PnL
-            # прошлых частичных закрытий (TP1 и т.п.) уже учтён в equity в момент
-            # их собственного register_close(); pos.realized_pnl - только для лога.
-            self.risk.register_close(symbol, pos.side, chunk_pnl)
-            if self.trade_log and pos.trade_id is not None:
-                self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, f"kill_switch:{reason}")
-            self.positions.pop(symbol, None)
-
+        # Останавливаем фоновых watcher'ов ДО закрытия - иначе _watch_position
+        # может в этот самый момент тикать по стопу/встречной стенке на той же
+        # позиции и гонка с закрытием ниже (см. self._close_locks в __init__ -
+        # тот же принцип, здесь дополнительно глушим watcher'ов заранее, а не
+        # только полагаемся на лок, раз уж всё равно вызываем их отмену чуть ниже).
         for t in self._watchers.values():
             t.cancel()
         self._watchers.clear()
+
+        for symbol, pos in list(self.positions.items()):
+            async with self._get_close_lock(symbol):
+                # Пока ждали лок, позицию мог уже закрыть параллельный вызов
+                # (reversal_signal из handle_signal, если он успел проскочить
+                # до того, как kill_switch.active стало True) - перепроверяем.
+                if self.positions.get(symbol) is not pos:
+                    continue
+                await self._flatten_one(symbol, pos, reason)
+
         log.warning("Все позиции закрыты, новые входы заблокированы (kill switch: %s).", reason)
+
+    async def _flatten_one(self, symbol: str, pos: ManagedPosition, reason: str):
+        try:
+            live_pos = await self.exchange.get_position(pos.market)
+        except Exception:
+            live_pos = None
+        size = abs(live_pos["size"]) if live_pos else pos.filled_size
+
+        exit_price = None
+        if size > 1e-9:
+            exit_is_ask = pos.side == "long"  # закрытие long = продажа, short = покупка
+            snap = self._latest_snap.get(symbol)
+            # закрываемся агрессивно (навстречу лучшей цене), не post-only - это аварийный выход.
+            # В paper дополнительно пересекаем спред с буфером (см. _close_price) -
+            # без этого reduce-only IOC мог не исполниться, и аварийное закрытие
+            # оставляло бы реальный хвост на бирже, хотя мы считали его закрытым.
+            fallback = (snap.best_bid if exit_is_ask else snap.best_ask) if snap else pos.avg_entry
+            price = self._close_price(snap, exit_is_ask, fallback)
+            try:
+                result, _, _ = await self.exchange.place_limit_order(
+                    pos.market, next_client_order_index(), size, price, exit_is_ask,
+                    reduce_only=True, post_only=False,
+                )
+                avg = getattr(result, "avg_price", None) if result is not None else None
+                exit_price = avg or price
+            except Exception as e:
+                log.error("[%s] не удалось закрыть позицию при kill switch: %s", symbol, e)
+
+        # Итоговый PnL сделки = уже накопленное по прошлым частичным закрытиям
+        # (TP1 и т.п., см. pos.realized_pnl) + PnL последнего закрытого куска
+        # здесь. Не используем _estimate_closed_pnl.pnl напрямую - он посчитан
+        # от pos.filled_size (весь исходный размер), что задвоило бы PnL для
+        # позиций, у которых TP1 уже сработал до kill switch.
+        if exit_price is None:
+            _, exit_price = self._estimate_closed_pnl(pos)
+        chunk_pnl = 0.0
+        if size > 1e-9:
+            direction = 1 if pos.side == "long" else -1
+            chunk_pnl = (exit_price - pos.avg_entry) * direction * size
+            pos.realized_pnl += chunk_pnl
+        # equity двигаем только на PnL ИМЕННО этого (последнего) куска - PnL
+        # прошлых частичных закрытий (TP1 и т.п.) уже учтён в equity в момент
+        # их собственного register_close(); pos.realized_pnl - только для лога.
+        self.risk.register_close(symbol, pos.side, chunk_pnl)
+        if self.trade_log and pos.trade_id is not None:
+            self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, f"kill_switch:{reason}")
+        self.positions.pop(symbol, None)
 
     async def shutdown(self):
         for t in self._watchers.values():
