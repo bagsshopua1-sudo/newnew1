@@ -58,28 +58,18 @@ class RiskManager:
     # ------------------------------------------------------------------ #
 
     def can_trade(self) -> bool:
+        """
+        Раньше здесь были два circuit breaker'а: остановка до конца дня при
+        достижении дневного лимита убытка (DAILY_LOSS_LIMIT_PCT) и пауза на
+        COOLDOWN_MINUTES после MAX_CONSECUTIVE_LOSSES убытков подряд. Отключено
+        по просьбе пользователя - бот сейчас тестируется в paper-режиме на
+        виртуальные деньги ("тещу щас все равно на фантики"), останавливать
+        торговлю из-за "убытков" смысла не имеет, это только мешает смотреть,
+        как ведёт себя логика входа/выхода вживую. equity/consecutive_losses
+        по-прежнему считаются в register_close() и видны на дашборде - просто
+        больше ни на что не влияют.
+        """
         self._roll_day_if_needed()
-        if self.cooldown_until and time.time() < self.cooldown_until:
-            return False
-
-        daily_loss = self.day_start_equity - self.equity
-        if daily_loss >= self.day_start_equity * CFG.daily_loss_limit_pct / 100:
-            if not self._daily_breach_notified:
-                self._daily_breach_notified = True
-                log.warning("Дневной лимит убытка достигнут (%.2f USD) — торговля остановлена до конца дня.",
-                            daily_loss)
-                self._notify_breach("daily_loss_limit")
-            return False
-
-        if self.consecutive_losses >= CFG.max_consecutive_losses:
-            self.cooldown_until = time.time() + CFG.cooldown_minutes * 60
-            if not self._streak_breach_notified:
-                self._streak_breach_notified = True
-                log.warning("%d убытков подряд — пауза на %.0f мин.",
-                            self.consecutive_losses, CFG.cooldown_minutes)
-                self._notify_breach("max_consecutive_losses")
-            return False
-
         return True
 
     def _notify_breach(self, reason: str):
