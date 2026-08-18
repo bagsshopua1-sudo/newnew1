@@ -103,5 +103,11 @@ class TradeLog:
         curve.append({"ts": time.time(), "equity": eq})
         return curve
 
+    def reset(self):
+        """Полностью очищает историю сделок - см. OrderManager.reset_account.
+        Схему таблицы не трогаем, только данные."""
+        self.conn.execute("DELETE FROM trades")
+        self.conn.commit()
+
     def close(self):
         self.conn.close()
