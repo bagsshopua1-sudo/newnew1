@@ -54,7 +54,9 @@ async def run_trading():
         if CFG.use_binance_signals else None
 
     trend_filters = {sym: TrendFilter(CFG.trend_ema_fast_sec, CFG.trend_ema_slow_sec,
-                                       CFG.vol_lookback, CFG.vol_spike_mult) for sym in markets}
+                                       CFG.vol_lookback, CFG.vol_spike_mult,
+                                       CFG.dead_range_lookback_sec, CFG.dead_range_min_pct,
+                                       CFG.dead_range_min_coverage_sec) for sym in markets}
     engines = {sym: SignalEngine(sym, trend_filter=trend_filters[sym], trade_feed=binance_trades)
                for sym in markets}
 
