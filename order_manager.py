@@ -288,7 +288,7 @@ class OrderManager:
                 # отсекает шум/безубыток), ждать нельзя: за 2 тика (~2с) цена успевает
                 # откатить обратно и прибыль превращается в убыток (см. коммент к
                 # OPPOSING_WALL_MIN_PROFIT_PCT в config.py - именно так и было в проде).
-                if self._opposing_wall_exit(pos, signal_snap):
+                if self._opposing_wall_exit(pos, signal_snap, snap):
                     await self._close_position_now(pos, snap, "opposing_wall")
                     if not self.has_position(pos.symbol):
                         return
@@ -354,7 +354,7 @@ class OrderManager:
 
         return False
 
-    def _opposing_wall_exit(self, pos: ManagedPosition, snap) -> bool:
+    def _opposing_wall_exit(self, pos: ManagedPosition, signal_snap, exec_snap) -> bool:
         """
         Фиксация прибыли у НОВОЙ встречной стенки, не связанной с исходным
         сигналом. _thesis_invalidated следит только за стенкой/уровнем, от
@@ -369,6 +369,13 @@ class OrderManager:
         Не ждёт thesis_grace_period_sec - это не про "тезис входа был неверным",
         а про новый факт на рынке, который появился уже после входа.
 
+        Специально НЕ требуем от встречной стенки сильной "подложки" (в отличие
+        от входа по ABSORPTION, см. signals.py) - логика тут обратная: если
+        сопротивление слабое и вот-вот развалится, тем более нет смысла ждать
+        подтверждения, лучше зафиксировать прибыль сейчас, пока она есть
+        (пример пользователя: лонг упёрся в стенку 2М, а подложки под ней
+        меньше 1.5М - именно повод закрыться, а не ждать).
+
         ВАЖНО: "в прибыли" - это не просто mid чуть выше входа (буквально любой
         шум в 0.001% с крупной стенкой на глубоком стакане Binance закрывал бы
         сделку немедленно - и после round-trip проскальзывания на входе/выходе
@@ -378,19 +385,25 @@ class OrderManager:
         но это не фиксированное число для всех ситуаций: масштабируем порог
         волатильностью рынка на момент входа (0.15% при спокойном рынке и при
         резком движении - разные вещи, см. entry_volatility_pct/config.py).
+
+        ВАЖНО #2: прибыль считаем от РЕАЛЬНОЙ цены исполнения (exec_snap = Lighter,
+        тот же стакан, где avg_entry) - а не от signal_snap (Binance), иначе
+        basis Binance/Lighter (наблюдался ~0.02%) искажает расчёт "в прибыли ли
+        мы вообще", хоть и на небольшую величину. Структуру (встречную стенку)
+        по-прежнему берём с Binance - там стакан глубже.
         """
-        if snap is None:
+        if signal_snap is None or exec_snap is None:
             return False
         effective_min_profit_pct = max(
             CFG.opposing_wall_min_profit_pct,
             pos.entry_volatility_pct * CFG.opposing_wall_vol_multiplier,
         )
-        profit_pct = ((snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
-            else ((pos.avg_entry - snap.mid) / pos.avg_entry * 100)
+        profit_pct = ((exec_snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
+            else ((pos.avg_entry - exec_snap.mid) / pos.avg_entry * 100)
         if profit_pct < effective_min_profit_pct:
             return False
         # для лонга встречная стенка - на продажу (ask), для шорта - на покупку (bid)
-        opposing_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
+        opposing_walls = signal_snap.ask_walls if pos.side == "long" else signal_snap.bid_walls
         return len(opposing_walls) > 0
 
     async def _update_trailing_stop(self, pos: ManagedPosition, price: float):
