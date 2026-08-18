@@ -120,6 +120,11 @@ class ManagedPosition:
     # эти две ветки, которые до этого закрывали мгновенно, за 1 тик.
     wall_eaten_streak: int = 0
     imbalance_streak: int = 0
+    # Размер стенки, от которой реально вошли в сделку (Signal.wall_usd на
+    # момент входа) - используется в новой версии dominance-проверки выше
+    # ("стенка просела относительно СВОЕГО же размера на входе"), а не
+    # сравнивается с каким-то фиксированным числом на все сделки сразу.
+    entry_wall_usd: float = 0.0
 
 
 class OrderManager:
@@ -305,7 +310,7 @@ class OrderManager:
                 symbol=signal.symbol, side=plan.side, market=market, plan=plan,
                 filled_size=filled_size, avg_entry=avg_entry, current_sl_price=plan.stop_price,
                 signal_type=signal.signal_type, reference_price=signal.reference_price,
-                entry_volatility_pct=signal.volatility_pct,
+                entry_volatility_pct=signal.volatility_pct, entry_wall_usd=signal.wall_usd,
             )
             self.positions[signal.symbol] = pos
             if self.trade_log:
@@ -642,22 +647,38 @@ class OrderManager:
             return False
 
         # Сравнение силы стенок - НЕ завязано на signal_type и НЕ завязано на
-        # % прибыли (в отличие от _opposing_wall_exit ниже). Логика напрямую
-        # от пользователя: "если лонг идёт хорошо вверх и упирается в стенку
-        # 1кк, а сейчас держит цену стенка всего 200к - надо выходить, так как
-        # 1кк сильнее 200к". Берём ближайшую к цене стенку с каждой стороны -
-        # именно она реально "держит"/"блокирует" цену прямо сейчас, а не
-        # самая крупная стенка где-то далеко в стакане. Если стенки, которая
-        # держит движение, вообще нет (0) - это ещё хуже, чем слабая: любая
-        # блокирующая стенка тогда считается доминирующей.
+        # % прибыли (в отличие от _opposing_wall_exit ниже). Берём ближайшую к
+        # цене стенку с каждой стороны - именно она реально "держит"/
+        # "блокирует" цену прямо сейчас, а не самая крупная стенка где-то
+        # далеко в стакане. Если стенки, которая держит движение, вообще нет
+        # (0) - это ещё хуже, чем слабая: любая блокирующая стенка тогда
+        # считается доминирующей.
+        #
+        # ПЕРЕПИСАНО 18.08 вечером по прямой просьбе пользователя - раньше
+        # тут был голый ratio=1.0 (любой перевес блокирующей стенки над
+        # держащей, хоть на цент, считался разворотом) - и это оказалась
+        # самая шумная из всех проверок, дёргающая structure_invalidated на
+        # каждую мелкую флуктуацию. Новая логика - конкретный пример от
+        # пользователя: "если он лонгует и заявка с 1.5кк [размер стенки НА
+        # ВХОДЕ] стала 400к, а верхняя в шорт стала 1.5кк - то надо
+        # выходить". Т.е. это не "чуть перевесило", а решительный разворот:
+        # (а) стенка, от которой вошли, ЗАМЕТНО просела относительно своего
+        # же размера на входе (см. pos.entry_wall_usd), И (б) встречная
+        # стенка успела дорасти до того же калибра, что и вход (тот же
+        # порог, что даёт сигнал на вход - CFG.binance_wall_min_usd/
+        # wall_min_usd) - обе стенки должны стать "зеркальными" по факту, а
+        # не просто одна на волосок больше другой.
         blocking_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
         holding_walls = snap.bid_walls if pos.side == "long" else snap.ask_walls
         dominance_now = False
-        if blocking_walls:
+        if blocking_walls and pos.entry_wall_usd > 0:
             nearest_blocking = min(blocking_walls, key=lambda w: w.distance_pct)
             nearest_holding = min(holding_walls, key=lambda w: w.distance_pct) if holding_walls else None
             holding_usd = nearest_holding.usd if nearest_holding else 0.0
-            dominance_now = nearest_blocking.usd >= holding_usd * CFG.wall_dominance_ratio
+            entry_wall_shrunk = holding_usd <= pos.entry_wall_usd * CFG.wall_flip_shrink_ratio
+            opposing_grade_threshold = CFG.binance_wall_min_usd if CFG.use_binance_signals else CFG.wall_min_usd
+            opposing_grew_to_real_wall = nearest_blocking.usd >= opposing_grade_threshold
+            dominance_now = entry_wall_shrunk and opposing_grew_to_real_wall
         # Отдельный, собственный счётчик подряд идущих тиков для ЭТОЙ проверки
         # (не общий invalidation_streak) - см. комментарий у
         # pos.wall_dominance_streak. Разовое дёрганье стенки на 1 тик больше
