@@ -84,15 +84,23 @@ class TradeLog:
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
         }
 
-    def equity_curve(self, start_equity: float) -> List[dict]:
+    def equity_curve(self, start_equity: float, start_ts: Optional[float] = None) -> List[dict]:
+        """
+        start_ts - метка времени начала отсчёта (например, старт процесса) - точка
+        с эквити на старте должна идти ПЕРВОЙ по времени, а не с текущим ts=now
+        (была именно так и это ломало хронологический порядок точек графика).
+        """
         rows = self.conn.execute(
             "SELECT closed_at, pnl_usd FROM trades WHERE closed_at IS NOT NULL ORDER BY closed_at ASC"
         ).fetchall()
         eq = start_equity
-        curve = [{"ts": time.time(), "equity": eq}]
+        curve = [{"ts": start_ts if start_ts is not None else time.time(), "equity": eq}]
         for ts, pnl in rows:
             eq += pnl or 0
             curve.append({"ts": ts, "equity": eq})
+        # финальная точка "сейчас" - чтобы график доходил до текущей эквити,
+        # даже если последняя сделка закрылась какое-то время назад.
+        curve.append({"ts": time.time(), "equity": eq})
         return curve
 
     def close(self):
