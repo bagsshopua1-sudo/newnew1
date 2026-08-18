@@ -211,6 +211,7 @@ class MarketData:
         backoff = 1
         consecutive_failures = 0
         while True:
+            connected_at = time.time()
             try:
                 log.info("Подключение к WS стакана Lighter (%s)...", self.exchange.endpoint.ws_url)
                 await self._ws.run_async()
@@ -238,14 +239,33 @@ class MarketData:
                 backoff = min(backoff * 2, 30)
                 continue
             except Exception as e:
+                # Найдено в проде 18.08: сервер Lighter сам обрывает соединение
+                # каждые ~3-4 минуты ("received 1000 (OK)...i/o timeout; no close
+                # frame sent") - это регулярная, рутинная ротация со стороны
+                # сервера/инфраструктуры, а не реальный сбой связи. Проблема была
+                # в том, что run_async() у этой библиотеки ВСЕГДА завершается
+                # исключением при разрыве (даже при штатном закрытии), а строки
+                # сброса backoff=1/consecutive_failures=0 ниже выполняются только
+                # если run_async() вернулся БЕЗ исключения - то есть на практике
+                # они не выполнялись никогда. В итоге backoff только рос и
+                # навсегда упирался в потолок (30s) после первых же 5 разрывов -
+                # каждое из ~20+ переподключений за сессию вслепую ждало по 30
+                # секунд без реальных проблем со связью, отсюда регулярные "дыры"
+                # в цене исполнения Lighter. Если сессия прожила достаточно долго
+                # (>60с) перед разрывом - это и есть штатная ротация, а не серия
+                # сбоев - сбрасываем backoff, чтобы переподключаться почти сразу.
+                session_lifetime = time.time() - connected_at
+                if session_lifetime > 60:
+                    backoff = 1
+                    consecutive_failures = 0
                 consecutive_failures += 1
-                log.warning("WS соединение оборвалось (%s), переподключение через %ss (попытка %d)",
-                            e, backoff, consecutive_failures)
+                log.warning("WS соединение оборвалось (%s) после %.0fs на связи, переподключение через %ss (попытка %d)",
+                            e, session_lifetime, backoff, consecutive_failures)
                 if consecutive_failures >= 5 and not self._outage_notified and self.on_prolonged_outage:
                     self._outage_notified = True
                     asyncio.create_task(self.on_prolonged_outage("ws_disconnected"))
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2, 5)
                 continue
             backoff = 1
             consecutive_failures = 0
