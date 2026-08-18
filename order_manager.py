@@ -52,6 +52,11 @@ class ManagedPosition:
     signal_type: str = ""
     reference_price: float = 0.0
     realized_pnl: float = 0.0  # накапливается по частичным закрытиям (TP1 + финал)
+    # Счётчик подряд идущих проверок, где _thesis_invalidated вернул True - см.
+    # _watch_position: закрываем не по первому же срабатыванию (это может быть
+    # шум в стакане на долю секунды), а только после INVALIDATION_CONFIRM_TICKS
+    # подтверждений подряд.
+    invalidation_streak: int = 0
 
 
 class OrderManager:
@@ -268,9 +273,15 @@ class OrderManager:
                 signal_snap = self._latest_signal_snap.get(pos.symbol) or snap
                 if time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and \
                         self._thesis_invalidated(pos, signal_snap):
+                    pos.invalidation_streak += 1
+                else:
+                    pos.invalidation_streak = 0
+
+                if pos.invalidation_streak >= CFG.invalidation_confirm_ticks:
                     await self._close_position_now(pos, snap, "structure_invalidated")
                     if not self.has_position(pos.symbol):
                         return
+                    pos.invalidation_streak = 0
                     continue
 
         except asyncio.CancelledError:
