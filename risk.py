@@ -102,24 +102,20 @@ class RiskManager:
         ни слишком узкий стоп (шум выбьет), ни неоправданно широкий.
 
         wall_usd/backup_usd - размер стенки и подложки за ней (Signal.wall_usd/
-        backup_usd, см. signals.py). ПРОБЛЕМА, которую это решает: при входе по
-        ABSORPTION мы заходим ПРЯМО у стенки, поэтому |entry-wall_price| ~ 0 -
-        raw_distance почти всегда падал на голый MIN_STOP_PCT floor, то есть стоп
-        был на фиксированном % от цены, вообще не привязанном ни к какому
-        реальному уровню в стакане (жалоба пользователя: "заходим по заявке 2кк,
-        а стоп где-то у какой-то другой заявки"). Вместо этого масштабируем
-        дистанцию реальной глубиной ЗА стенкой: чем сильнее подложка относительно
-        размера стенки, тем больше похоже, что уровень продержится под давлением,
-        и тем больше места даём стопу (до края WALL_BACKUP_RANGE_PCT) - вместо
-        того, чтобы резать по проценту "на глаз". При тонкой подложке (она и так
-        уже отсеивается фильтром WALL_BACKUP_MIN_RATIO на входе, см. signals.py)
-        дистанция остаётся у нижнего края (MIN_STOP_PCT). ВАЖНО: это НЕ ставка на
-        то, что именно эта ликвидность будет жива к моменту срабатывания стопа -
-        за миллисекунды она может исчезнуть так же, как и сама стенка (см.
-        WALL_CANDIDATE-логи со спуфингом). Подложка тут только определяет
-        ДИСТАНЦИЮ/риск сделки в моменте входа, а не место будущего исполнения -
-        закрывающий ордер по-прежнему бьёт по реальному живому стакану Lighter в
-        момент закрытия (_close_price/create_sl_order), а не по этой цифре.
+        backup_usd, см. signals.py). ПОПРОБОВАЛИ 18.08 масштабировать дистанцию
+        стопа глубиной подложки за стенкой (чем сильнее подложка относительно
+        стенки, тем шире стоп, до края WALL_BACKUP_RANGE_PCT) вместо голого
+        MIN_STOP_PCT floor - идея была в том, что стоп у самой стенки (raw_distance
+        ~0, входим-то ПРЯМО у неё) вообще не привязан ни к какому уровню в
+        стакане. ОТКАЧено по прямой просьбе пользователя в тот же день - сразу
+        после деплоя пошла серия минусов. Разбор логов показал, что те минусы
+        были НЕ от стопа (все закрытия были structure_invalidated/reversal на
+        мёртвом боковике, см. CFG.dead_range_min_pct - реальная причина серии),
+        но раз пользователь прямо попросил вернуть как было - оставляем
+        wall_usd/backup_usd в сигнатуре (используется по умолчанию НЕ используется
+        ниже), чтобы не трогать всю цепочку Signal->handle_signal, но стоп снова
+        считается только от структуры сигнала + MIN/MAX_STOP_PCT, без подложки.
+        Если захотим вернуться к этой идее - она тут, просто закомментирована.
         """
         if wall_price:
             raw_distance = abs(entry_price - wall_price) + entry_price * CFG.stop_buffer_pct / 100
@@ -129,11 +125,12 @@ class RiskManager:
         min_distance = entry_price * CFG.min_stop_pct / 100
         max_distance = entry_price * CFG.max_stop_pct / 100
 
-        if wall_usd > 0 and backup_usd > 0:
-            backup_ratio = min(backup_usd / wall_usd, 1.0)
-            backup_edge_distance = entry_price * CFG.wall_backup_range_pct / 100
-            structural_distance = min_distance + (backup_edge_distance - min_distance) * backup_ratio
-            raw_distance = max(raw_distance, structural_distance)
+        # ОТКЛЮЧЕНО по просьбе пользователя 18.08 - см. докстринг выше.
+        # if wall_usd > 0 and backup_usd > 0:
+        #     backup_ratio = min(backup_usd / wall_usd, 1.0)
+        #     backup_edge_distance = entry_price * CFG.wall_backup_range_pct / 100
+        #     structural_distance = min_distance + (backup_edge_distance - min_distance) * backup_ratio
+        #     raw_distance = max(raw_distance, structural_distance)
 
         stop_distance = min(max(raw_distance, min_distance), max_distance)
 
