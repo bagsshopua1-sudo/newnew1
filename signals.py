@@ -139,6 +139,8 @@ class SignalEngine:
         # потока снапшотов - для нормировки WALL_SCORE (Binance-порог на порядок
         # выше Lighter-порога, доля от него значит разное в абсолютных USD).
         self.base_wall_min_usd = CFG.binance_wall_min_usd if CFG.use_binance_signals else CFG.wall_min_usd
+        # Троттлинг лога "рынок мёртвый" - см. CFG.dead_range_min_pct ниже в on_snapshot.
+        self._last_dead_market_log_ts = 0.0
 
     @staticmethod
     def _bucket(price: float) -> float:
@@ -190,7 +192,7 @@ class SignalEngine:
         self.history.append(snap)
         now = snap.ts
 
-        trend_state = self.trend_filter.update(snap.mid)
+        trend_state = self.trend_filter.update(snap.mid, snap.ts)
         self.last_trend_state = trend_state
         if trend_state.high_volatility:
             # аномальный всплеск волатильности - стакан ведёт себя нештатно, сигналы не генерируем
@@ -289,6 +291,23 @@ class SignalEngine:
 
         if breakout_signal:
             return breakout_signal
+
+        if trend_state.is_dead:
+            # "Мёртвый" рынок - см. TrendState.is_dead/CFG.dead_range_min_pct.
+            # Не глушим BREAKOUT (он уже отработан выше, до этой проверки) -
+            # пробой сам по себе означает, что цена ТОЛЬКО ЧТО вышла из
+            # диапазона, это конец боковика, а не его продолжение. Глушим
+            # только ABSORPTION - именно фейды в обе стороны на одном и том
+            # же шуме и вызывали серию мелких убытков (см. комментарий у
+            # CFG.dead_range_min_pct). Логируем раз в CFG.absorption_min_refire_sec
+            # на стенку не имеет смысла - тут глушим сразу все кандидаты одним
+            # логом, чтобы не спамить.
+            if now - self._last_dead_market_log_ts >= 10.0:
+                log.info("[%s] рынок мёртвый: диапазон %.3f%% за %.0fs < %.3f%% - ABSORPTION приостановлен",
+                          self.symbol, trend_state.range_pct, CFG.dead_range_lookback_sec,
+                          CFG.dead_range_min_pct)
+                self._last_dead_market_log_ts = now
+            return None
 
         # ABSORPTION: ищем стенку, простоявшую достаточно и с накопленным stall_count
         for tw in self.tracked.values():
