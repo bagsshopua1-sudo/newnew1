@@ -98,7 +98,10 @@ class SignalEngine:
         self.symbol = symbol
         self.history: Deque[BookSnapshot] = deque(maxlen=history_len)
         self.tracked: Dict[float, _TrackedWall] = {}  # bucketed price -> _TrackedWall
-        self.min_wall_age_sec = 3.0  # стенка должна простоять хотя бы столько, чтобы считаться "реальной"
+        # стенка должна простоять хотя бы столько, чтобы считаться "реальной" -
+        # см. CFG.min_wall_age_sec (было жёстко зашито 3.0, вынесено в настройку
+        # из-за жалобы на слишком позднее подтверждение сигнала).
+        self.min_wall_age_sec = CFG.min_wall_age_sec
         self.trend_filter = trend_filter or TrendFilter()
         self.last_trend_state = None
         # BinanceTradeFeed - реальный исполненный объём у стенки (см. binance_trades.py).
@@ -264,7 +267,7 @@ class SignalEngine:
         # ABSORPTION: ищем стенку, простоявшую достаточно и с накопленным stall_count
         for tw in self.tracked.values():
             age = now - tw.first_seen
-            if age >= self.min_wall_age_sec and tw.stall_count >= 3:
+            if age >= self.min_wall_age_sec and tw.stall_count >= CFG.absorption_stall_ticks:
                 side = "short" if tw.wall.side == "ask" else "long"
                 if not TrendFilter.allows_fade(side, trend_state):
                     continue  # не фейдим против сильного тренда
