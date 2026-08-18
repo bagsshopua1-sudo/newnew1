@@ -10,12 +10,35 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import lighter
+import lighter.ws_client as _lighter_ws_client
 import websockets.exceptions
 
 from config import CFG
 from exchange_client import MarketInfo
 
 log = logging.getLogger("market_data")
+
+# lighter.WsClient.run_async() вызывает connect_async(url) без параметров,
+# из-за чего действуют дефолты библиотеки websockets: ping_interval=20,
+# ping_timeout=20 - клиент сам шлёт служебные WS-ping-фреймы (протокольный
+# уровень) и обрывает соединение, если за 20с не получил pong. Сервер Lighter
+# на такие фреймы, судя по продовым логам, не отвечает - у него свой heartbeat
+# на уровне JSON-сообщений ({"type":"ping"} -> клиент отвечает {"type":"pong"},
+# см. WsClient.on_message_async, это уже отдельно и корректно обрабатывается).
+# В итоге реальное соединение обрывалось каждые ~2 минуты ошибкой "keepalive
+# ping timeout" и стакан Lighter почти никогда не оставался живым дольше пары
+# минут. Патчим connect_async, чтобы отключить именно протокольный пинг -
+# ping_interval=None - и полагаться на JSON-heartbeat, который сервер
+# действительно поддерживает.
+_orig_lighter_connect_async = _lighter_ws_client.connect_async
+
+
+def _patched_connect_async(url, **kwargs):
+    kwargs.setdefault("ping_interval", None)
+    return _orig_lighter_connect_async(url, **kwargs)
+
+
+_lighter_ws_client.connect_async = _patched_connect_async
 
 
 @dataclass
