@@ -1,7 +1,7 @@
 """
 Веб-дашборд статуса бота — тот самый "сайт", через который следишь за ботом,
-не заходя на ПК. Одна страница: режим, депозит/PnL, открытые позиции,
-история сделок, лог событий, и кнопка аварийной остановки (kill switch).
+не заходя на ПК. Одна страница: режим, депозит/PnL, график эквити, открытые
+позиции, история сделок, лог событий, и кнопка аварийной остановки (kill switch).
 
 Отдаёт также /api/status (JSON) для программного доступа и
 /api/kill, /api/resume для управления kill switch.
@@ -16,6 +16,13 @@ log = logging.getLogger("dashboard")
 
 MAX_EVENTS = 200
 
+# Новое калибровочное логирование (WALL_CANDIDATE/WALL_OUTCOME на каждый тик
+# стакана, latency на каждый сигнал) - полезно в логах Render для анализа, но
+# на дашборде это просто мусор, который топит реально важные события (сделки,
+# ошибки, kill switch). Фильтруем на уровне перехвата, а не на клиенте, чтобы
+# не гонять лишний JSON туда-обратно каждые 3 секунды.
+_NOISY_SUBSTRINGS = ("WALL_CANDIDATE", "WALL_OUTCOME", "latency signal_age_ms")
+
 
 class EventLog:
     def __init__(self):
@@ -26,7 +33,8 @@ class EventLog:
 
 
 class DashboardLogHandler(logging.Handler):
-    """Перехватывает все логи бота в кольцевой буфер для показа на дашборде."""
+    """Перехватывает логи бота в кольцевой буфер для показа на дашборде
+    (кроме калибровочного шума - см. _NOISY_SUBSTRINGS)."""
 
     def __init__(self, event_log: EventLog):
         super().__init__()
@@ -34,7 +42,10 @@ class DashboardLogHandler(logging.Handler):
 
     def emit(self, record):
         try:
-            self.event_log.add(record.levelname, self.format(record))
+            msg = self.format(record)
+            if any(s in msg for s in _NOISY_SUBSTRINGS):
+                return
+            self.event_log.add(record.levelname, msg)
         except Exception:
             pass
 
@@ -68,6 +79,7 @@ class Dashboard:
                 "symbol": sym, "side": pos.side, "size": round(pos.filled_size, 6),
                 "avg_entry": round(pos.avg_entry, 4), "sl": round(pos.current_sl_price, 4),
                 "tp1_done": pos.tp1_done, "trailing": pos.trailing_active,
+                "opened_at": pos.opened_at, "signal_type": pos.signal_type,
             })
         return {
             "mode": self.mode,
@@ -81,8 +93,9 @@ class Dashboard:
             "positions": positions,
             "stats": self.trade_log.stats(),
             "recent_trades": [t.__dict__ for t in self.trade_log.recent(20)],
-            "equity_curve": self.trade_log.equity_curve(self.risk.day_start_equity),
+            "equity_curve": self.trade_log.equity_curve(self.risk.day_start_equity, self.started_at),
             "events": list(self.events.events)[-60:][::-1],
+            "server_ts": time.time(),
         }
 
     async def handle_status(self, request):
@@ -113,62 +126,126 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Lighter Bot — статус</title>
+<title>Lighter DOM-Bot</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #0a0c12;
+    --panel: #12151f;
+    --panel-2: #171b28;
+    --border: #232838;
+    --text: #e8eaf1;
+    --muted: #7d859c;
+    --accent: #5b8cff;
+    --green: #34d399;
+    --red: #f2596b;
+    --amber: #f0b656;
+  }
   * { box-sizing: border-box; }
-  body { margin:0; padding:24px; background:#0b0e14; color:#e6e8ee;
-         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  h1 { font-size:20px; margin:0 0 4px; }
-  .sub { color:#8b93a7; font-size:13px; margin-bottom:20px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin-bottom:20px; }
-  .card { background:#141824; border:1px solid #232838; border-radius:10px; padding:14px 16px; }
-  .card .label { color:#8b93a7; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  .card .value { font-size:22px; font-weight:600; margin-top:4px; }
-  .pos-val { color:#3ddc84; } .neg-val { color:#ff5c72; }
+  html, body { margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  body { padding: 20px 20px 60px; max-width: 1080px; margin: 0 auto; }
+
+  .topbar { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px;
+    flex-wrap:wrap; gap:10px; }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .brand h1 { font-size:17px; margin:0; font-weight:650; letter-spacing:-.01em; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--green); flex:none;
+    box-shadow:0 0 0 3px rgba(52,211,153,.15); }
+  .dot.stale { background:var(--amber); box-shadow:0 0 0 3px rgba(240,182,86,.15); }
+  .dot.dead { background:var(--red); box-shadow:0 0 0 3px rgba(242,89,107,.15); }
+  .meta { color:var(--muted); font-size:12.5px; }
+  .meta b { color:var(--text); font-weight:600; }
+
+  .kill-banner { background:linear-gradient(180deg,#2a1219,#20101a); border:1px solid #4a1f2a;
+    color:#ffb3bf; padding:12px 16px; border-radius:12px; margin-bottom:18px; font-size:13.5px;
+    display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .toolbar { display:flex; justify-content:flex-end; margin-bottom:18px; }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .card .label { color:var(--muted); font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; }
+  .card .value { font-size:21px; font-weight:650; margin-top:6px; letter-spacing:-.01em; }
+  .card .sub { font-size:11.5px; color:var(--muted); margin-top:3px; }
+  .pos-val { color:var(--green); } .neg-val { color:var(--red); }
+
+  section { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:16px 18px; margin-bottom:14px; }
+  section .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  section h2 { font-size:13px; margin:0; color:#c7cbdb; font-weight:600;
+    text-transform:uppercase; letter-spacing:.04em; }
+  section .head .hint { font-size:11.5px; color:var(--muted); }
+
+  #chartWrap { position:relative; }
+  #chartSvg { width:100%; height:120px; display:block; }
+  #chartEmpty { color:var(--muted); font-size:13px; padding:30px 0; text-align:center; }
+
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:6px 10px; border-bottom:1px solid #1d2230; white-space:nowrap; }
-  th { color:#8b93a7; font-weight:500; }
-  section { background:#141824; border:1px solid #232838; border-radius:10px; padding:16px; margin-bottom:16px; }
-  section h2 { font-size:14px; margin:0 0 12px; color:#c7cbdb; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:20px; font-size:12px; font-weight:600; }
-  .badge.long { background:#123d2a; color:#3ddc84; }
-  .badge.short { background:#3d1420; color:#ff5c72; }
-  .kill-banner { background:#3d1420; border:1px solid #ff5c72; color:#ff9aa8; padding:10px 14px;
-                 border-radius:8px; margin-bottom:16px; font-size:13px; }
-  button { background:#ff5c72; color:#fff; border:none; padding:8px 16px; border-radius:6px;
-           font-weight:600; cursor:pointer; font-size:13px; }
-  button.resume { background:#3ddc84; color:#08130d; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { color:var(--muted); font-weight:500; font-size:11.5px; text-transform:uppercase; letter-spacing:.03em; }
+  tr:last-child td { border-bottom:none; }
+  tbody tr:hover { background:rgba(255,255,255,.02); }
+
+  .badge { display:inline-block; padding:2px 9px; border-radius:20px; font-size:11.5px; font-weight:650;
+    letter-spacing:.02em; }
+  .badge.long { background:rgba(52,211,153,.13); color:var(--green); }
+  .badge.short { background:rgba(242,89,107,.13); color:var(--red); }
+
+  button { background:var(--red); color:#fff; border:none; padding:9px 16px; border-radius:8px;
+    font-weight:600; cursor:pointer; font-size:13px; transition:opacity .15s; }
+  button.resume { background:var(--green); color:#08130d; }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--muted); }
   button:hover { opacity:.85; }
-  .event-line { font-family:ui-monospace,Menlo,monospace; font-size:12px; padding:3px 0; color:#aab0c2; }
-  .event-WARNING { color:#f5c66e; } .event-ERROR { color:#ff5c72; }
-  #eventsBox { max-height:260px; overflow-y:auto; }
-  .row-actions { display:flex; gap:8px; align-items:center; }
-  .empty { color:#8b93a7; font-size:13px; padding:10px 0; }
+
+  .event-line { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
+    padding:4px 0; color:#a7adc0; border-bottom:1px solid rgba(255,255,255,.03); }
+  .event-line .t { color:var(--muted); margin-right:8px; }
+  .event-WARNING { color:var(--amber); } .event-ERROR { color:var(--red); }
+  #eventsBox { max-height:280px; overflow-y:auto; }
+  #eventsBox::-webkit-scrollbar { width:6px; }
+  #eventsBox::-webkit-scrollbar-thumb { background:var(--border); border-radius:3px; }
+
+  .empty { color:var(--muted); font-size:13px; padding:14px 0; text-align:center; }
+  .footer-note { color:var(--muted); font-size:11.5px; text-align:center; margin-top:20px; }
 </style>
 </head>
 <body>
-  <h1>Lighter DOM-Bot</h1>
-  <div class="sub" id="subheader">загрузка...</div>
+  <div class="topbar">
+    <div class="brand">
+      <span class="dot" id="liveDot"></span>
+      <h1>Lighter DOM-Bot</h1>
+    </div>
+    <div class="meta" id="subheader">загрузка...</div>
+  </div>
 
   <div id="killBanner"></div>
 
   <div class="grid" id="statCards"></div>
 
   <section>
-    <h2>Открытые позиции</h2>
+    <div class="head"><h2>Эквити</h2><div class="hint" id="chartHint"></div></div>
+    <div id="chartWrap"><svg id="chartSvg" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+      <div id="chartEmpty" style="display:none;">пока нет закрытых сделок</div>
+    </div>
+  </section>
+
+  <section>
+    <div class="head"><h2>Открытые позиции</h2></div>
     <div id="positionsBox"><div class="empty">нет открытых позиций</div></div>
   </section>
 
   <section>
-    <h2>Последние сделки</h2>
+    <div class="head"><h2>Последние сделки</h2></div>
     <div id="tradesBox"><div class="empty">сделок пока нет</div></div>
   </section>
 
   <section>
-    <h2>Лог событий</h2>
+    <div class="head"><h2>Лог событий</h2><div class="hint">только сделки/предупреждения/ошибки</div></div>
     <div id="eventsBox"></div>
   </section>
+
+  <div class="toolbar" id="toolbar"></div>
+  <div class="footer-note">обновляется каждые 3с</div>
 
 <script>
 function fmt(n, d=2) { return (typeof n === 'number') ? n.toFixed(d) : n; }
@@ -180,6 +257,12 @@ function tsToTime(ts) {
   if (!ts) return '-';
   return new Date(ts*1000).toLocaleString('ru-RU', {hour:'2-digit', minute:'2-digit', second:'2-digit', day:'2-digit', month:'2-digit'});
 }
+function tsToShortTime(ts) {
+  if (!ts) return '-';
+  return new Date(ts*1000).toLocaleString('ru-RU', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+
+let lastStatusAt = 0;
 
 async function killSwitch() {
   if (!confirm('Закрыть все позиции и остановить бота?')) return;
@@ -191,49 +274,108 @@ async function resumeBot() {
   refresh();
 }
 
+function renderChart(curve) {
+  const svg = document.getElementById('chartSvg');
+  const empty = document.getElementById('chartEmpty');
+  const hint = document.getElementById('chartHint');
+  if (!curve || curve.length < 2) {
+    svg.style.display = 'none'; empty.style.display = 'block'; hint.textContent = '';
+    return;
+  }
+  svg.style.display = 'block'; empty.style.display = 'none';
+
+  const W = 600, H = 120, PAD = 6;
+  const values = curve.map(p => p.equity);
+  let min = Math.min(...values), max = Math.max(...values);
+  if (min === max) { min -= 1; max += 1; }
+  const n = curve.length;
+  const x = i => PAD + (i/(n-1)) * (W - PAD*2);
+  const y = v => H - PAD - ((v-min)/(max-min)) * (H - PAD*2);
+
+  const first = values[0], last = values[values.length-1];
+  const up = last >= first;
+  const stroke = up ? 'var(--green)' : 'var(--red)';
+  const fillId = up ? 'gGreen' : 'gRed';
+
+  let path = 'M ' + x(0) + ' ' + y(values[0]);
+  for (let i=1;i<n;i++) path += ' L ' + x(i) + ' ' + y(values[i]);
+  let areaPath = path + ' L ' + x(n-1) + ' ' + H + ' L ' + x(0) + ' ' + H + ' Z';
+
+  svg.innerHTML = `
+    <defs>
+      <linearGradient id="gGreen" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#34d399" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="#34d399" stop-opacity="0"/>
+      </linearGradient>
+      <linearGradient id="gRed" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#f2596b" stop-opacity="0.25"/>
+        <stop offset="100%" stop-color="#f2596b" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <path d="${areaPath}" fill="url(#${fillId})" stroke="none"></path>
+    <path d="${path}" fill="none" stroke="${stroke}" stroke-width="1.75" vector-effect="non-scaling-stroke"></path>
+  `;
+  const deltaPct = first !== 0 ? ((last-first)/Math.abs(first)*100) : 0;
+  hint.textContent = `${up?'+':''}${fmt(last-first)}$ (${up?'+':''}${fmt(deltaPct,2)}%) за период`;
+  hint.style.color = up ? 'var(--green)' : 'var(--red)';
+}
+
 async function refresh() {
   let s;
   try {
     s = await (await fetch('/api/status')).json();
-  } catch (e) { return; }
+  } catch (e) {
+    document.getElementById('liveDot').className = 'dot dead';
+    return;
+  }
+  lastStatusAt = Date.now()/1000;
+  document.getElementById('liveDot').className = 'dot';
 
-  document.getElementById('subheader').textContent =
-    `режим: ${s.mode} | символы: ${s.symbols.join(', ')} | аптайм: ${timeAgo(s.uptime_sec)}`;
+  document.getElementById('subheader').innerHTML =
+    `режим: <b>${s.mode}</b> &nbsp;·&nbsp; ${s.symbols.join(', ')} &nbsp;·&nbsp; аптайм ${timeAgo(s.uptime_sec)}`;
 
   const killBanner = document.getElementById('killBanner');
+  const toolbar = document.getElementById('toolbar');
   if (s.kill_switch_active) {
-    killBanner.innerHTML = `<div class="kill-banner">⛔ KILL SWITCH АКТИВЕН (${s.kill_switch_reason}) — новые входы заблокированы.
-      <button class="resume" onclick="resumeBot()" style="margin-left:10px;">Возобновить торговлю</button></div>`;
+    killBanner.innerHTML = `<div class="kill-banner">
+      <span>⛔ <b>Kill switch активен</b> (${s.kill_switch_reason}) — новые входы заблокированы</span>
+      <button class="resume" onclick="resumeBot()">Возобновить торговлю</button></div>`;
+    toolbar.innerHTML = '';
   } else {
-    killBanner.innerHTML = `<div class="row-actions" style="margin-bottom:16px;">
-      <button onclick="killSwitch()">⛔ Аварийная остановка</button></div>`;
+    killBanner.innerHTML = '';
+    toolbar.innerHTML = `<button class="ghost" onclick="killSwitch()">⛔ Аварийная остановка</button>`;
   }
 
   const pnlClass = s.equity_usd >= s.day_start_equity_usd ? 'pos-val' : 'neg-val';
   document.getElementById('statCards').innerHTML = `
-    <div class="card"><div class="label">Equity</div><div class="value ${pnlClass}">$${fmt(s.equity_usd)}</div></div>
-    <div class="card"><div class="label">Депозит на начало дня</div><div class="value">$${fmt(s.day_start_equity_usd)}</div></div>
-    <div class="card"><div class="label">Всего сделок</div><div class="value">${s.stats.total_trades}</div></div>
-    <div class="card"><div class="label">Win-rate</div><div class="value">${fmt(s.stats.win_rate,1)}%</div></div>
-    <div class="card"><div class="label">Суммарный PnL</div><div class="value ${s.stats.total_pnl>=0?'pos-val':'neg-val'}">$${fmt(s.stats.total_pnl)}</div></div>
-    <div class="card"><div class="label">Убытков подряд</div><div class="value">${s.consecutive_losses}</div></div>
+    <div class="card"><div class="label">Equity</div><div class="value ${pnlClass}">$${fmt(s.equity_usd)}</div>
+      <div class="sub">старт дня $${fmt(s.day_start_equity_usd)}</div></div>
+    <div class="card"><div class="label">Суммарный PnL</div><div class="value ${s.stats.total_pnl>=0?'pos-val':'neg-val'}">$${fmt(s.stats.total_pnl)}</div>
+      <div class="sub">${s.stats.total_trades} сделок</div></div>
+    <div class="card"><div class="label">Win-rate</div><div class="value">${fmt(s.stats.win_rate,1)}%</div>
+      <div class="sub">avg win $${fmt(s.stats.avg_win)} / avg loss $${fmt(s.stats.avg_loss)}</div></div>
+    <div class="card"><div class="label">Убытков подряд</div><div class="value">${s.consecutive_losses}</div>
+      <div class="sub">${s.kill_switch_active ? 'пауза активна' : 'ок'}</div></div>
   `;
+
+  renderChart(s.equity_curve);
 
   const pb = document.getElementById('positionsBox');
   pb.innerHTML = s.positions.length === 0 ? '<div class="empty">нет открытых позиций</div>' :
-    `<table><tr><th>Символ</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Стоп</th><th>TP1</th><th>Трейлинг</th></tr>` +
+    `<table><tr><th>Символ</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Стоп</th><th>TP1</th><th>Трейлинг</th><th>Открыта</th></tr>` +
     s.positions.map(p => `<tr>
       <td>${p.symbol}</td>
       <td><span class="badge ${p.side}">${p.side.toUpperCase()}</span></td>
       <td>${fmt(p.size,6)}</td><td>${fmt(p.avg_entry,4)}</td><td>${fmt(p.sl,4)}</td>
       <td>${p.tp1_done ? '✅' : '—'}</td><td>${p.trailing ? '🔄' : '—'}</td>
+      <td>${p.opened_at ? timeAgo(Math.max(0, s.server_ts - p.opened_at)) + ' назад' : '—'}</td>
     </tr>`).join('') + `</table>`;
 
   const tb = document.getElementById('tradesBox');
   tb.innerHTML = s.recent_trades.length === 0 ? '<div class="empty">сделок пока нет</div>' :
     `<table><tr><th>Время</th><th>Символ</th><th>Сторона</th><th>Вход</th><th>Выход</th><th>PnL</th><th>Причина</th></tr>` +
     s.recent_trades.map(t => `<tr>
-      <td>${tsToTime(t.closed_at || t.opened_at)}</td><td>${t.symbol}</td>
+      <td>${tsToShortTime(t.closed_at || t.opened_at)}</td><td>${t.symbol}</td>
       <td><span class="badge ${t.side}">${t.side.toUpperCase()}</span></td>
       <td>${fmt(t.entry_price,4)}</td><td>${t.exit_price ? fmt(t.exit_price,4) : '—'}</td>
       <td class="${(t.pnl_usd||0)>=0?'pos-val':'neg-val'}">${t.pnl_usd!=null ? '$'+fmt(t.pnl_usd) : 'открыта'}</td>
@@ -242,12 +384,17 @@ async function refresh() {
 
   const eb = document.getElementById('eventsBox');
   eb.innerHTML = s.events.map(e =>
-    `<div class="event-line event-${e.level}">${tsToTime(e.ts)} [${e.level}] ${e.message}</div>`
+    `<div class="event-line event-${e.level}"><span class="t">${tsToShortTime(e.ts)}</span>[${e.level}] ${e.message}</div>`
   ).join('') || '<div class="empty">пока пусто</div>';
 }
 
 refresh();
 setInterval(refresh, 3000);
+setInterval(() => {
+  if (Date.now()/1000 - lastStatusAt > 12) {
+    document.getElementById('liveDot').className = 'dot stale';
+  }
+}, 2000);
 </script>
 </body>
 </html>"""
