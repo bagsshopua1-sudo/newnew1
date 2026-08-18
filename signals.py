@@ -74,6 +74,14 @@ class Signal:
     # режим рынка вместо одного фиксированного % на все случаи (см. обсуждение
     # с пользователем - 0.15% при спокойном рынке и при резком движении не одно и то же).
     volatility_pct: float = 0.0
+    # Размер стенки и подложки за ней (см. Wall.usd/backup_usd в market_data.py) -
+    # используется risk.build_plan для структурного стопа: раньше стоп считался
+    # от "вход-стенка" (~0, мы же входим ПРЯМО у стенки) и почти всегда падал на
+    # голый MIN_STOP_PCT floor, никак не связанный со стаканом (см. обсуждение с
+    # пользователем - "заходим по заявке 2кк, а стоп где-то у другой заявки").
+    # Теперь дистанция масштабируется реальной глубиной за стенкой.
+    wall_usd: float = 0.0
+    backup_usd: float = 0.0
 
 
 @dataclass
@@ -254,6 +262,8 @@ class SignalEngine:
                         confidence=self._confidence(snap, side, boost=0.15),
                         ts=now,
                         volatility_pct=trend_state.volatility_pct,
+                        wall_usd=tw.wall.usd,
+                        backup_usd=tw.wall.backup_usd,
                     )
                     self._log_wall_candidate(tw, side, snap, age, passed=True, reason="",
                                               signal_type="breakout")
@@ -323,6 +333,8 @@ class SignalEngine:
                     confidence=self._confidence(snap, side),
                     ts=now,
                     volatility_pct=trend_state.volatility_pct,
+                    wall_usd=tw.wall.usd,
+                    backup_usd=tw.wall.backup_usd,
                 )
                 self._log_wall_candidate(tw, side, snap, age, passed=True, reason="")
                 log.info("[%s] ABSORPTION %s у %.2f (стенка стоит %.1fs, %.0f USD, stall=%d)",
