@@ -341,6 +341,52 @@ class Config:
     # работать только для micro-scalping и учитывать текущую волатильность).
     time_exit_sec: float = field(default_factory=lambda: _f("TIME_EXIT_SEC", 90.0))
     time_exit_min_profit_pct: float = field(default_factory=lambda: _f("TIME_EXIT_MIN_PROFIT_PCT", 0.05))
+    # === Уточнение TIME_EXIT (аудит, этап 5) ===
+    # TIME_EXIT задуман для micro-scalp тезиса ABSORPTION ("либо отрабатывает
+    # быстро, либо повода держать больше нет") - BREAKOUT это трендовое
+    # продолжение, у него законно может уйти больше времени на разгон, поэтому
+    # свой, намного более длинный лимит.
+    time_exit_breakout_sec: float = field(default_factory=lambda: _f("TIME_EXIT_BREAKOUT_SEC", 240.0))
+    # Масштабирование TIME_EXIT_SEC текущей волатильностью на входе (см.
+    # Signal.volatility_pct/pos.entry_volatility_pct) - при более высокой
+    # волатильности, чем этот референс, тезис должен отработать быстрее
+    # (окно сокращается, до 0.5x), при более низкой - разумно дать больше
+    # времени (окно растёт, до 2x), зажато в [TIME_EXIT_MIN_SEC, TIME_EXIT_MAX_SEC].
+    time_exit_vol_ref_pct: float = field(default_factory=lambda: _f("TIME_EXIT_VOL_REF_PCT", 0.03))
+    time_exit_min_sec: float = field(default_factory=lambda: _f("TIME_EXIT_MIN_SEC", 30.0))
+    time_exit_max_sec: float = field(default_factory=lambda: _f("TIME_EXIT_MAX_SEC", 300.0))
+
+    # === THESIS WEAKENING - частичный выход по затуханию импульса (аудит,
+    # этап 5) ===
+    # Отдельно от THESIS INVALIDATED (структура реально сломалась - см.
+    # _thesis_invalidated, полное закрытие) - WEAKENING ловит момент, когда
+    # позиция УЖЕ была в заметном плюсе (MFE), а потом заметная часть этого
+    # плюса откатилась НАЗАД, хотя формальная структура (стенка/уровень) ещё
+    # не инвалидирована. Частичный выход фиксирует часть уже заработанного,
+    # остаток продолжает жить по обычным правилам (SL/TP1/трейлинг/INVALIDATED).
+    # MFE должен быть заметно больше шумовой полосы (WALL_EATEN_FLAT_PCT),
+    # иначе это сработает на обычном шуме сразу после входа.
+    weakening_mfe_min_mult: float = field(default_factory=lambda: _f("WEAKENING_MFE_MIN_MULT", 1.5))
+    # Доля отката ОТ MFE (не от entry), после которой считаем импульс
+    # затухающим - например 0.5 значит "откатили половину уже набранного пути".
+    momentum_decay_retrace_pct: float = field(default_factory=lambda: _f("MOMENTUM_DECAY_RETRACE_PCT", 0.5))
+    # Какую долю ОСТАВШЕГОСЯ размера закрыть при первом срабатывании WEAKENING
+    # (срабатывает не больше одного раза за сделку - см. ManagedPosition.weakening_partial_done).
+    weakening_partial_close_pct: float = field(default_factory=lambda: _f("WEAKENING_PARTIAL_CLOSE_PCT", 0.3))
+
+    # === Shadow-режим для новой ABSORPTION/BREAKOUT логики (аудит, этап 3/4) ===
+    # ВАЖНО: эти пороги НЕ гейтят реальные сигналы - только логируются как
+    # WOULD_ENTER/WOULD_SKIP в wall_event_log.py (shadow_evals) для сравнения с
+    # реальным исходом (WALL_OUTCOME) ПОСЛЕ накопления данных, по прямой
+    # договорённости с пользователем ("не оптимизируй пороги, пока не
+    # накопится достаточно данных"). Все значения ниже - первые прикидки,
+    # не откалиброваны.
+    shadow_min_executed_ratio: float = field(default_factory=lambda: _f("SHADOW_MIN_EXECUTED_RATIO", 0.15))
+    shadow_weakening_flow_ratio: float = field(default_factory=lambda: _f("SHADOW_WEAKENING_FLOW_RATIO", 0.7))
+    shadow_breakout_min_age_sec: float = field(default_factory=lambda: _f("SHADOW_BREAKOUT_MIN_AGE_SEC", 4.0))
+    shadow_breakout_min_executed_ratio: float = field(
+        default_factory=lambda: _f("SHADOW_BREAKOUT_MIN_EXECUTED_RATIO", 0.2))
+    shadow_breakout_eaten_ratio: float = field(default_factory=lambda: _f("SHADOW_BREAKOUT_EATEN_RATIO", 0.5))
 
     def validate(self):
         assert self.mode in ("collect", "paper", "live"), f"Неизвестный MODE={self.mode}"
