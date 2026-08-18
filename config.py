@@ -211,6 +211,28 @@ class Config:
     vol_lookback: int = field(default_factory=lambda: _i("VOL_LOOKBACK", 60))
     vol_spike_mult: float = field(default_factory=lambda: _f("VOL_SPIKE_MULT", 3.0))
 
+    # === Детектор "мёртвого" рынка (найдено в проде 18.08) ===
+    # allows_fade() блокирует фейд ABSORPTION только ПРОТИВ тренда - при
+    # trend=="flat" пропускает сигналы в ОБЕ стороны без ограничений. Реальный
+    # случай: BTC простоял в коридоре ~25 пунктов (0.04% от цены) 6 минут
+    # подряд - бот открыл 8 сделок (фейды то в лонг, то в шорт на один и тот
+    # же шум), все 8 в минус, только на проскальзывании/буфере исполнения -
+    # реального движения там ловить было нечего. Раньше это было отмечено как
+    # "отдельная более глубокая тема" (см. комментарий у REENTRY_COOLDOWN_SEC) -
+    # теперь реализовано: если весь диапазон цены за DEAD_RANGE_LOOKBACK_SEC
+    # секунд уже, чем DEAD_RANGE_MIN_PCT - ABSORPTION не генерируется вообще
+    # (BREAKOUT не трогаем - там сигнал сам по себе означает, что цена ТОЛЬКО
+    # ЧТО вышла из диапазона, это не "мёртвый" рынок, а конец боковика).
+    # DEAD_RANGE_MIN_PCT=0.08 - первая прикидка по реальному логу того самого
+    # дохлого участка (диапазон был 0.04%), не откалибровано по большой
+    # выборке - см. WALL_CANDIDATE-подход в signals.py, стоит собрать логи и
+    # уточнить, если увидим либо слишком частые "рынок мёртвый" в логах на
+    # нормальном рынке, либо что чоп всё равно проскакивает.
+    dead_range_lookback_sec: float = field(default_factory=lambda: _f("DEAD_RANGE_LOOKBACK_SEC", 90.0))
+    dead_range_min_pct: float = field(default_factory=lambda: _f("DEAD_RANGE_MIN_PCT", 0.08))
+    dead_range_min_coverage_sec: float = field(
+        default_factory=lambda: _f("DEAD_RANGE_MIN_COVERAGE_SEC", 45.0))
+
     # === Источник сигнала - стакан Binance Futures (публичный REST, без ключей) ===
     # У Lighter стакан тоньше, чем у Binance - крупные заявки на Binance надёжнее
     # отражают реальный интерес. Исполнение всё равно на Lighter (0 комиссий).
@@ -273,7 +295,10 @@ class Config:
     # закрытию. Не решает чоп полностью (это отдельная, более глубокая тема -
     # детектор "мёртвого" рынка по волатильности), но обрывает самый быстрый и
     # дорогой цикл - мгновенный флип-флоп на одном и том же уровне.
-    reentry_cooldown_sec: float = field(default_factory=lambda: _f("REENTRY_COOLDOWN_SEC", 15.0))
+    # Снижено с 15 до 1 сек по прямой просьбе пользователя 18.08 - основной
+    # защитой от мёртвого боковика теперь должен быть DEAD_RANGE_MIN_PCT
+    # (см. выше), а не долгая пауза после каждого закрытия.
+    reentry_cooldown_sec: float = field(default_factory=lambda: _f("REENTRY_COOLDOWN_SEC", 1.0))
 
     # === Кулдаун на ПОВТОРНЫЙ разворот (найдено в проде 18.08) ===
     # REENTRY_COOLDOWN_SEC выше не действует на развороты (existing is not
@@ -290,7 +315,9 @@ class Config:
     # (сигнал пропускается, текущая позиция остаётся и живёт по своим
     # обычным правилам выхода - стоп/тейк/structure_invalidated), пока не
     # пройдёт этот интервал.
-    reversal_cooldown_sec: float = field(default_factory=lambda: _f("REVERSAL_COOLDOWN_SEC", 10.0))
+    # Снижено с 10 до 1 сек по прямой просьбе пользователя 18.08 - см. тот же
+    # комментарий у REENTRY_COOLDOWN_SEC выше.
+    reversal_cooldown_sec: float = field(default_factory=lambda: _f("REVERSAL_COOLDOWN_SEC", 1.0))
 
     def validate(self):
         assert self.mode in ("collect", "paper", "live"), f"Неизвестный MODE={self.mode}"
