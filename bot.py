@@ -14,9 +14,11 @@ MODE=live    -> то же самое, но реальными деньгами �
 """
 import asyncio
 import logging
+import time
 from typing import Dict
 
 from binance_feed import BinanceFeed
+from binance_trades import BinanceTradeFeed
 from config import CFG
 from dashboard import Dashboard
 from exchange_client import ExchangeClient
@@ -43,11 +45,18 @@ async def run_trading():
     orders = OrderManager(exchange, md, risk, trade_log=trade_log, kill_switch=kill_switch)
     kill_switch.bind(orders)
 
+    binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger) if CFG.use_binance_signals else None
+    # Поток реальных исполненных сделок (aggTrade) - отдельно от снепшотов
+    # стакана, нужен для "сколько реально прошло объёма у этой стенки", а не
+    # только "какой displayed size сейчас видно" (см. binance_trades.py).
+    binance_trades = BinanceTradeFeed(markets, on_prolonged_outage=kill_switch.trigger) \
+        if CFG.use_binance_signals else None
+
     trend_filters = {sym: TrendFilter(CFG.trend_ema_fast_sec, CFG.trend_ema_slow_sec,
                                        CFG.vol_lookback, CFG.vol_spike_mult) for sym in markets}
-    engines = {sym: SignalEngine(sym, trend_filter=trend_filters[sym]) for sym in markets}
+    engines = {sym: SignalEngine(sym, trend_filter=trend_filters[sym], trade_feed=binance_trades)
+               for sym in markets}
 
-    binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger) if CFG.use_binance_signals else None
     latest_lighter_snap: Dict[str, "BookSnapshot"] = {}
 
     dashboard = Dashboard(risk, orders, trade_log, kill_switch, CFG.dashboard_port, CFG.mode, list(markets.keys()))
@@ -56,6 +65,8 @@ async def run_trading():
     await md.start()
     if binance:
         await binance.start()
+    if binance_trades:
+        await binance_trades.start()
     log.info("Бот запущен в режиме MODE=%s | символы: %s | депозит=%.2f USD | риск/сделка=%.1f%% | "
               "источник сигнала=%s | дашборд на порту %d",
               CFG.mode, ", ".join(markets.keys()), CFG.account_equity_usd, CFG.risk_per_trade_pct,
@@ -104,10 +115,17 @@ async def run_trading():
         if signal.confidence < 0.5:
             return  # слабый сигнал без подтверждения имбалансом/трендом - пропускаем
 
+        # Латентность: сколько времени прошло между событием стакана, которое
+        # породило сигнал, и тем, что бот его обработал - важно на free tier
+        # (Frankfurt), где сеть/CPU не гарантированы. Если сигналу уже условно
+        # 300+ мс, к моменту реального входа он может успеть "протухнуть".
+        signal_age_ms = (time.time() - signal_snap.ts) * 1000
+        basis_pct = abs(lighter_snap.mid - signal_snap.mid) / lighter_snap.mid * 100 if binance else 0.0
+        log.info("[%s] latency signal_age_ms=%.0f basis_pct=%.4f", signal.symbol, signal_age_ms, basis_pct)
+
         if binance:
             # basis-проверка: сигнал построен по Binance, но торгуем на Lighter -
             # если цены разошлись сильнее порога, вход по этому сигналу не оправдан.
-            basis_pct = abs(lighter_snap.mid - signal_snap.mid) / lighter_snap.mid * 100
             if basis_pct > CFG.basis_max_divergence_pct:
                 log.warning("[%s] сигнал пропущен: базис Lighter/Binance %.3f%% > порога %.3f%%",
                             signal.symbol, basis_pct, CFG.basis_max_divergence_pct)
@@ -130,6 +148,8 @@ async def run_trading():
         await md.stop()
         if binance:
             await binance.stop()
+        if binance_trades:
+            await binance_trades.stop()
         await exchange.close()
         trade_log.close()
 
