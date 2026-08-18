@@ -306,6 +306,13 @@ class SignalEngine:
                               self.symbol, side.upper(), tw.wall.price, tw.wall.backup_usd, min_backup)
                     self._log_wall_candidate(tw, side, snap, age, passed=False, reason="thin_backup")
                     tw.stall_count = 0
+                    # Тот же дебаунс, что и у выданного сигнала (см. last_signal_ts
+                    # выше) - без этого ОТКЛОНЁННЫЙ по тонкой подложке кандидат
+                    # спамит "ПРОПУЩЕН: тонкая подложка" точно так же пачками
+                    # внутри одной группы почти одновременных снепшотов, просто с
+                    # другим текстом лога - обнаружено в проде после первого
+                    # раунда фикса (дебаунс тогда стоял только на пути success).
+                    tw.last_signal_ts = now
                     continue
                 sig = Signal(
                     symbol=self.symbol,
