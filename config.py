@@ -319,6 +319,29 @@ class Config:
     # комментарий у REENTRY_COOLDOWN_SEC выше.
     reversal_cooldown_sec: float = field(default_factory=lambda: _f("REVERSAL_COOLDOWN_SEC", 1.0))
 
+    # === Аудит стратегии 18.08 - этап 2 ("убрать очевидный мусор") ===
+    # zone_cancels_5m раньше только логировался внутри WALL_SCORE (ни на что
+    # не влиял) - если в одной и той же ценовой зоне заявки регулярно
+    # снимаются именно при подходе цены (>= этого числа за последние 5 минут,
+    # см. _zone_cancel_count в signals.py), это подозрительно похоже на
+    # спуфинг, и сигнал по такой зоне (и ABSORPTION, и BREAKOUT) пропускается.
+    # ПОРОГ НЕ ОТКАЛИБРОВАН по выборке - первая прикидка (как когда-то
+    # DEAD_RANGE_MIN_PCT), отклонённые кандидаты по-прежнему логируются
+    # (reason=spoof_zone_cancels) для последующей проверки по накопленным
+    # данным (wall_event_log.py).
+    spoof_zone_cancel_max: int = field(default_factory=lambda: _i("SPOOF_ZONE_CANCEL_MAX", 4))
+
+    # === TIME_EXIT (аудит стратегии 18.08, этап 2.3) ===
+    # Если сделка открыта дольше TIME_EXIT_SEC и за это время так и не сдвинулась
+    # в нашу пользу дальше TIME_EXIT_MIN_PROFIT_PCT - тезис явно не отрабатывает
+    # (ни быстрый импульс, на который и рассчитана эта стратегия, ни нормальный
+    # ход к TP1), закрываем вместо того чтобы висеть неопределённо долго в
+    # ожидании стопа. БАЗОВАЯ версия - плоское время без учёта волатильности/
+    # режима рынка; это будет уточнено в этапе 5 аудита (TIME_EXIT должен
+    # работать только для micro-scalping и учитывать текущую волатильность).
+    time_exit_sec: float = field(default_factory=lambda: _f("TIME_EXIT_SEC", 90.0))
+    time_exit_min_profit_pct: float = field(default_factory=lambda: _f("TIME_EXIT_MIN_PROFIT_PCT", 0.05))
+
     def validate(self):
         assert self.mode in ("collect", "paper", "live"), f"Неизвестный MODE={self.mode}"
         assert self.network in ("mainnet", "testnet"), f"Неизвестная NETWORK={self.network}"
