@@ -272,23 +272,30 @@ class OrderManager:
                 # сигнал (Binance, если включён - там реальные стенки/дисбаланс)
                 signal_snap = self._latest_signal_snap.get(pos.symbol) or snap
 
-                # Встречная стенка НЕ ждёт grace period и не привязана к исходному
-                # тезису - это отдельный триггер "зафиксировать прибыль здесь", пока
-                # цена не откатила обратно (см. _opposing_wall_exit).
-                opposing_wall = self._opposing_wall_exit(pos, signal_snap)
+                # Встречная стенка закрывает НЕМЕДЛЕННО, без confirm-tick debounce -
+                # если уже сработало (порог по прибыли внутри _opposing_wall_exit
+                # отсекает шум/безубыток), ждать нельзя: за 2 тика (~2с) цена успевает
+                # откатить обратно и прибыль превращается в убыток (см. коммент к
+                # OPPOSING_WALL_MIN_PROFIT_PCT в config.py - именно так и было в проде).
+                if self._opposing_wall_exit(pos, signal_snap):
+                    await self._close_position_now(pos, snap, "opposing_wall")
+                    if not self.has_position(pos.symbol):
+                        return
+                    pos.invalidation_streak = 0
+                    continue
+
                 thesis_invalid = (
                     time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and
                     self._thesis_invalidated(pos, signal_snap)
                 )
 
-                if opposing_wall or thesis_invalid:
+                if thesis_invalid:
                     pos.invalidation_streak += 1
                 else:
                     pos.invalidation_streak = 0
 
                 if pos.invalidation_streak >= CFG.invalidation_confirm_ticks:
-                    reason = "opposing_wall" if opposing_wall else "structure_invalidated"
-                    await self._close_position_now(pos, snap, reason)
+                    await self._close_position_now(pos, snap, "structure_invalidated")
                     if not self.has_position(pos.symbol):
                         return
                     pos.invalidation_streak = 0
@@ -350,11 +357,19 @@ class OrderManager:
         закрыл сделку только на откате до 64210, вместо жёстко у стенки).
         Не ждёт thesis_grace_period_sec - это не про "тезис входа был неверным",
         а про новый факт на рынке, который появился уже после входа.
+
+        ВАЖНО: "в прибыли" - это не просто mid чуть выше входа (буквально любой
+        шум в 0.001% с крупной стенкой на глубоком стакане Binance закрывал бы
+        сделку немедленно - и после round-trip проскальзывания на входе/выходе
+        такое закрытие гарантированно давало убыток, что и наблюдалось в проде:
+        первые два opposing_wall закрытия дали -0.47 и -0.35 вместо прибыли).
+        Требуем движение минимум на OPPOSING_WALL_MIN_PROFIT_PCT от цены входа.
         """
         if snap is None:
             return False
-        in_profit = (snap.mid > pos.avg_entry) if pos.side == "long" else (snap.mid < pos.avg_entry)
-        if not in_profit:
+        profit_pct = ((snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
+            else ((pos.avg_entry - snap.mid) / pos.avg_entry * 100)
+        if profit_pct < CFG.opposing_wall_min_profit_pct:
             return False
         # для лонга встречная стенка - на продажу (ask), для шорта - на покупку (bid)
         opposing_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
