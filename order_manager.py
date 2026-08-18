@@ -86,6 +86,15 @@ class ManagedPosition:
     # начато, но не исполнилось целиком - следующая попытка идёт на САМОМ
     # СЛЕДУЮЩЕМ тике с той же причиной, без повторного набора подтверждений.
     pending_close_reason: Optional[str] = None
+    # MFE/MAE (max favorable / max adverse excursion, % от avg_entry, знак -
+    # "хорошо"/"плохо" для стороны позиции, не сырой ценовой знак) за весь
+    # срок жизни сделки - добавлено 18.08 (аудит стратегии, этап 1.1). Нужно,
+    # чтобы отличить "стоп сработал ровно там, где сделка объективно должна
+    # была закрыться" от "сделка была в плюсе X%, но выход упустил момент и
+    # закрыл хуже" - раньше TradeLog хранил только итоговый PnL, без этого
+    # измерить упущенный потенциал выхода было нельзя (см. AUDIT_2026-08-18.md).
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
 
 
 class OrderManager:
@@ -397,6 +406,20 @@ class OrderManager:
                     continue
                 price = snap.mid
 
+                # profit_pct от РЕАЛЬНОЙ цены исполнения (Lighter, тот же
+                # стакан, где avg_entry) - считаем один раз за тик и переиспользуем
+                # ниже (раньше пересчитывался отдельно ближе к концу функции
+                # только для wall_eaten_flat_pct - см. коммент там). Также отсюда
+                # обновляем MFE/MAE КАЖДЫЙ тик, до любых веток закрытия/continue
+                # ниже - иначе тик, на котором сработало закрытие, выпал бы из
+                # истории экскурсии (этап 1.1 аудита, см. ManagedPosition.mfe_pct).
+                profit_pct = ((price - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
+                    else ((pos.avg_entry - price) / pos.avg_entry * 100)
+                if profit_pct > pos.mfe_pct:
+                    pos.mfe_pct = profit_pct
+                if profit_pct < pos.mae_pct:
+                    pos.mae_pct = profit_pct
+
                 # Закрытие уже решено раньше, но не исполнилось целиком - см.
                 # ManagedPosition.pending_close_reason. Повторяем ТУ ЖЕ причину
                 # немедленно на этом тике, а не заново проверяем стоп/тейк/
@@ -461,6 +484,23 @@ class OrderManager:
                     pos.invalidation_streak = 0
                     continue
 
+                # TIME_EXIT (этап 2.3 аудита, 18.08) - если сделка висит дольше
+                # TIME_EXIT_SEC и так и не сдвинулась в нашу пользу дальше
+                # TIME_EXIT_MIN_PROFIT_PCT, тезис явно не отрабатывает так, как
+                # рассчитано (это стратегия на быстрый импульс/поглощение, не на
+                # "подождать подольше") - закрываем, вместо неопределённо долгого
+                # ожидания стопа. БАЗОВАЯ версия без учёта волатильности/режима -
+                # уточнение (только для micro-scalping, с поправкой на текущий
+                # regime) запланировано в этапе 5 аудита.
+                elapsed = time.time() - pos.opened_at
+                if elapsed >= CFG.time_exit_sec and profit_pct < CFG.time_exit_min_profit_pct:
+                    pos.pending_close_reason = "time_exit"
+                    await self._close_position_safely(pos, snap, "time_exit")
+                    if not self.has_position(pos.symbol):
+                        return
+                    pos.invalidation_streak = 0
+                    continue
+
                 thesis_invalid = (
                     time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and
                     self._thesis_invalidated(pos, signal_snap, snap)
@@ -483,9 +523,8 @@ class OrderManager:
                 # и требование реальной новой встречной стенки). Если позиция в
                 # минусе или около нуля - invalidation работает как раньше,
                 # мгновенно (это по-прежнему главная защита от мёртвого тезиса).
-                exec_price = snap.mid if snap else pos.avg_entry
-                profit_pct = ((exec_price - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
-                    else ((pos.avg_entry - exec_price) / pos.avg_entry * 100)
+                # profit_pct уже посчитан выше (в начале тика, от той же
+                # exec-цены Lighter) - переиспользуем вместо пересчёта.
                 already_profitable = profit_pct > CFG.wall_eaten_flat_pct
 
                 if thesis_invalid and not already_profitable:
@@ -824,9 +863,10 @@ class OrderManager:
         pos.realized_pnl += pnl
         self.risk.register_close(pos.symbol, pos.side, pnl)
         if self.trade_log and pos.trade_id is not None:
-            self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, reason)
+            self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, reason,
+                                        mfe_pct=pos.mfe_pct, mae_pct=pos.mae_pct)
         self.positions.pop(pos.symbol, None)
-        if reason in ("stop_loss", "opposing_wall", "structure_invalidated"):
+        if reason in ("stop_loss", "opposing_wall", "structure_invalidated", "time_exit"):
             # НЕ трогаем при reversal_signal - см. CFG.reentry_cooldown_sec/
             # комментарий у self._last_close_ts в __init__.
             self._last_close_ts[pos.symbol] = time.time()
@@ -920,7 +960,8 @@ class OrderManager:
         # их собственного register_close(); pos.realized_pnl - только для лога.
         self.risk.register_close(symbol, pos.side, chunk_pnl)
         if self.trade_log and pos.trade_id is not None:
-            self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, f"kill_switch:{reason}")
+            self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, f"kill_switch:{reason}",
+                                        mfe_pct=pos.mfe_pct, mae_pct=pos.mae_pct)
         self.positions.pop(symbol, None)
 
     # ------------------------------------------------------------------ #
