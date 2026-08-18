@@ -271,14 +271,24 @@ class OrderManager:
                 # структура сигнала оцениваем по тому же стакану, откуда пришёл
                 # сигнал (Binance, если включён - там реальные стенки/дисбаланс)
                 signal_snap = self._latest_signal_snap.get(pos.symbol) or snap
-                if time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and \
-                        self._thesis_invalidated(pos, signal_snap):
+
+                # Встречная стенка НЕ ждёт grace period и не привязана к исходному
+                # тезису - это отдельный триггер "зафиксировать прибыль здесь", пока
+                # цена не откатила обратно (см. _opposing_wall_exit).
+                opposing_wall = self._opposing_wall_exit(pos, signal_snap)
+                thesis_invalid = (
+                    time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and
+                    self._thesis_invalidated(pos, signal_snap)
+                )
+
+                if opposing_wall or thesis_invalid:
                     pos.invalidation_streak += 1
                 else:
                     pos.invalidation_streak = 0
 
                 if pos.invalidation_streak >= CFG.invalidation_confirm_ticks:
-                    await self._close_position_now(pos, snap, "structure_invalidated")
+                    reason = "opposing_wall" if opposing_wall else "structure_invalidated"
+                    await self._close_position_now(pos, snap, reason)
                     if not self.has_position(pos.symbol):
                         return
                     pos.invalidation_streak = 0
@@ -325,6 +335,30 @@ class OrderManager:
             return False
 
         return False
+
+    def _opposing_wall_exit(self, pos: ManagedPosition, snap) -> bool:
+        """
+        Фиксация прибыли у НОВОЙ встречной стенки, не связанной с исходным
+        сигналом. _thesis_invalidated следит только за стенкой/уровнем, от
+        которых был сигнал на вход - но по ходу движения цены в нашу пользу
+        может появиться СВЕЖАЯ крупная стенка на противоположной стороне
+        (сопротивление для лонга / поддержка для шорта), в которую цена упрётся
+        и от которой развернётся. Без этой проверки бот ждёт либо TP1, либо
+        развала исходного тезиса - а к этому моменту цена может откатить и
+        отдать почти всю набежавшую прибыль (пример из прода: памп до 64230,
+        тут же рядом выросла крупная стенка на шорт на 64225-64228, а бот
+        закрыл сделку только на откате до 64210, вместо жёстко у стенки).
+        Не ждёт thesis_grace_period_sec - это не про "тезис входа был неверным",
+        а про новый факт на рынке, который появился уже после входа.
+        """
+        if snap is None:
+            return False
+        in_profit = (snap.mid > pos.avg_entry) if pos.side == "long" else (snap.mid < pos.avg_entry)
+        if not in_profit:
+            return False
+        # для лонга встречная стенка - на продажу (ask), для шорта - на покупку (bid)
+        opposing_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
+        return len(opposing_walls) > 0
 
     async def _update_trailing_stop(self, pos: ManagedPosition, price: float):
         improved = False
