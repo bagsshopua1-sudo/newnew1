@@ -96,9 +96,40 @@ class OrderManager:
     async def handle_signal(self, market: MarketInfo, signal: Signal):
         if self.kill_switch and self.kill_switch.active:
             return  # аварийная остановка активна - новых входов нет
-        if self.has_position(signal.symbol) or signal.symbol in self._entering:
-            log.debug("[%s] уже есть открытая позиция или вход в процессе, сигнал пропущен", signal.symbol)
+        if signal.symbol in self._entering:
+            log.debug("[%s] вход уже в процессе, сигнал пропущен", signal.symbol)
             return
+
+        existing = self.positions.get(signal.symbol)
+        if existing is not None:
+            if existing.side == signal.side:
+                log.debug("[%s] уже есть открытая позиция в ту же сторону, сигнал пропущен", signal.symbol)
+                return
+            # Свежий сигнал ПРОТИВ открытой позиции (новая стенка/пробой с
+            # противоположной стороны) - это не шум, а реальный сдвиг структуры
+            # рынка. Раньше такой сигнал молча отбрасывался (has_position() ->
+            # return), и позиция ждала своих штатных условий выхода (стоп/тейк/
+            # thesis_invalidated с INVALIDATION_CONFIRM_TICKS подтверждениями) -
+            # жалоба пользователя: "после лонга надо сразу шортить, а оно стоит,
+            # потом цена падает и закрывает в минус". Закрываем НЕМЕДЛЕННО по
+            # рынку, без debounce (как и _opposing_wall_exit) - раз структура
+            # уже развернулась, ждать нет смысла, только отдаём движение.
+            log.info("[%s] РАЗВОРОТ: сигнал %s (%s) против открытой позиции %s - закрываем немедленно",
+                      signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
+            snap = self._latest_snap.get(signal.symbol)
+            await self._close_position_now(existing, snap, "reversal_signal")
+            if self.has_position(signal.symbol):
+                # Закрытие исполнилось не полностью (paper: не пересекло спред) -
+                # остаток всё ещё числится открытым, новую позицию поверх не
+                # открываем, следующий тик _watch_position дозакроет хвост.
+                return
+            watcher = self._watchers.pop(signal.symbol, None)
+            if watcher:
+                watcher.cancel()
+            # Ниже продолжаем этим же вызовом на вход в новую (развернутую)
+            # сторону - не ждём следующего независимого срабатывания сигнала,
+            # это и есть "сразу шортить", а не через один-два цикла проверки.
+
         if not self.risk.can_trade():
             return
 
