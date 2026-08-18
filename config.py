@@ -204,6 +204,16 @@ class Config:
     # уровня, а не одного случайного тика, но не удваивает и без того длинную
     # задержку до входа.
     absorption_stall_ticks: int = field(default_factory=lambda: _i("ABSORPTION_STALL_TICKS", 2))
+    # Минимальный интервал (сек) между повторными ABSORPTION-сигналами по ОДНОЙ
+    # И ТОЙ ЖЕ стенке. Найдено в проде: снепшоты Binance WS иногда приходят
+    # "пачкой" (несколько сообщений в пределах миллисекунд, а не штатным
+    # интервалом BINANCE_WS_SPEED_MS) - внутри такой пачки mid почти не
+    # меняется, поэтому stall_count успевает повторно дойти до
+    # ABSORPTION_STALL_TICKS ещё до конца пачки, и один и тот же сигнал
+    # выдавался по 10-40 раз за миллисекунды (лог-спам + лишние параллельные
+    # asyncio-задачи на один и тот же сигнал). НЕ влияет на скорость первого
+    # входа - см. signals.py.
+    absorption_min_refire_sec: float = field(default_factory=lambda: _f("ABSORPTION_MIN_REFIRE_SEC", 1.0))
 
     def validate(self):
         assert self.mode in ("collect", "paper", "live"), f"Неизвестный MODE={self.mode}"
