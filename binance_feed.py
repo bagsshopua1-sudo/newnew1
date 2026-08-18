@@ -11,18 +11,27 @@
 на Lighter - см. bot.py: сигнал берёт направление/тип с Binance, но цену
 входа/стопа - с текущего стакана Lighter (basis-проверка перед входом).
 
-Технически - обычный REST-поллинг GET /fapi/v1/depth раз в BINANCE_POLL_INTERVAL_SEC
-секунд с лимитом BINANCE_DEPTH_LIMIT уровней, а не WebSocket diff-стрим с
-синхронизацией по sequence-номерам (U/u/pu) - тот вариант быстрее (сотни мс),
-но сильно сложнее в реализации и не даёт выигрыша для этой задачи: стенки
-живут секундами, не миллисекундами (min_wall_age_sec в signals.py = 3с).
+Технически - WebSocket "partial book depth" стрим (<symbol>@depth<N>@<speed>),
+а не REST-поллинг. Причина смены: обычный REST GET /fapi/v1/depth на IP
+Render довольно быстро словил бан от Binance (HTTP 418 "Way too many
+requests" - вероятно, IP общий с другими клиентами Render и лимит
+исчерпывается не только нашими запросами). WS market-data стримы не
+тарифицируются по этому же лимиту и как раз для этого предназначены -
+сообщение самого Binance в теле 418-ошибки: "Please use the websocket
+for live updates to avoid bans". Partial-depth стрим - НЕ diff-поток:
+каждое сообщение уже готовый топ-N снепшот, синхронизация по
+sequence-номерам (U/u/pu) не нужна.
 """
 import asyncio
+import json
 import logging
 import time
 from typing import Dict, Optional
 
-import aiohttp
+try:
+    from websockets.asyncio.client import connect as ws_connect
+except ImportError:  # pragma: no cover - совместимость со старым websockets<13
+    from websockets.client import connect as ws_connect
 
 from config import CFG
 from exchange_client import MarketInfo
@@ -30,87 +39,94 @@ from market_data import BookSnapshot, analyze_book
 
 log = logging.getLogger("binance_feed")
 
-BASE_URL = "https://fapi.binance.com/fapi/v1/depth"
+WS_BASE = "wss://fstream.binance.com/stream"
 
 
-def to_binance_symbol(symbol: str) -> str:
-    return f"{symbol.upper()}USDT"
+def to_stream_name(symbol: str) -> str:
+    return f"{symbol.lower()}usdt@depth{CFG.binance_ws_depth_levels}@{CFG.binance_ws_speed_ms}ms"
 
 
 class BinanceFeed:
     def __init__(self, markets: Dict[str, MarketInfo], on_prolonged_outage=None):
-        self.markets = markets  # наш symbol ("ETH") -> MarketInfo (для market_id в снепшоте)
+        self.markets = markets  # наш symbol ("ETH") -> MarketInfo
+        self.stream_to_symbol = {to_stream_name(sym): sym for sym in markets}
         self.events: "asyncio.Queue[BookSnapshot]" = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
-        self._session: Optional[aiohttp.ClientSession] = None
         self.on_prolonged_outage = on_prolonged_outage
         self._outage_notified = False
+        self._warned_bad_format = False
 
     async def start(self):
-        self._session = aiohttp.ClientSession()
-        self._task = asyncio.create_task(self._run())
+        self._task = asyncio.create_task(self._run_with_reconnect())
         return self._task
 
-    async def _run(self):
-        consecutive_failures = 0
-        backoff = CFG.binance_poll_interval_sec
-        try:
-            while True:
-                cycle_start = time.monotonic()
-                any_ok = False
-                for symbol, market in self.markets.items():
-                    try:
-                        snap = await self._fetch_one(symbol, market)
-                        if snap is not None:
-                            any_ok = True
-                            try:
-                                self.events.put_nowait(snap)
-                            except asyncio.QueueFull:
-                                pass
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as e:
-                        log.warning("[%s] Binance depth: запрос не удался: %s", symbol, e)
+    def _url(self) -> str:
+        streams = "/".join(self.stream_to_symbol.keys())
+        return f"{WS_BASE}?streams={streams}"
 
-                if any_ok:
-                    if consecutive_failures:
-                        log.info("Binance depth: связь восстановлена")
+    async def _run_with_reconnect(self):
+        backoff = 1
+        consecutive_failures = 0
+        url = self._url()
+        while True:
+            try:
+                log.info("Подключение к WS стакана Binance (%s)...", url)
+                async with ws_connect(url) as ws:
+                    backoff = 1
                     consecutive_failures = 0
                     self._outage_notified = False
-                    backoff = CFG.binance_poll_interval_sec
-                else:
-                    consecutive_failures += 1
-                    log.warning("Binance depth: ни один символ не получен (попытка %d)", consecutive_failures)
-                    if consecutive_failures >= 5 and not self._outage_notified and self.on_prolonged_outage:
-                        self._outage_notified = True
-                        asyncio.create_task(self.on_prolonged_outage("binance_feed_disconnected"))
-                    backoff = min(backoff * 1.5, 30)
+                    async for raw in ws:
+                        self._handle_message(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                consecutive_failures += 1
+                log.warning("Binance WS оборвался (%s), переподключение через %ss (попытка %d)",
+                            e, backoff, consecutive_failures)
+                if consecutive_failures >= 5 and not self._outage_notified and self.on_prolonged_outage:
+                    self._outage_notified = True
+                    asyncio.create_task(self.on_prolonged_outage("binance_feed_disconnected"))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30)
 
-                elapsed = time.monotonic() - cycle_start
-                await asyncio.sleep(max(0.0, backoff - elapsed) if consecutive_failures else
-                                     max(0.0, CFG.binance_poll_interval_sec - elapsed))
-        except asyncio.CancelledError:
-            pass
-        finally:
-            if self._session:
-                await self._session.close()
+    def _handle_message(self, raw):
+        try:
+            msg = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        stream = msg.get("stream")
+        data = msg.get("data") or msg  # на всякий случай - вдруг придёт не в конверте combined-stream
+        symbol = self.stream_to_symbol.get(stream)
+        if symbol is None:
+            return
+        market = self.markets[symbol]
 
-    async def _fetch_one(self, symbol: str, market: MarketInfo) -> Optional[BookSnapshot]:
-        params = {"symbol": to_binance_symbol(symbol), "limit": CFG.binance_depth_limit}
-        async with self._session.get(BASE_URL, params=params,
-                                      timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"HTTP {resp.status}: {text[:300]}")
-            data = await resp.json()
+        # Формат полей документирован для diff-потока Futures ("b"/"a"); у
+        # partial-depth потока предполагается тот же конверт, но на случай
+        # расхождения пробуем и альтернативные имена ("bids"/"asks", как у Spot).
+        raw_bids = data.get("b") or data.get("bids")
+        raw_asks = data.get("a") or data.get("asks")
+        if not raw_bids or not raw_asks:
+            if not self._warned_bad_format:
+                self._warned_bad_format = True
+                log.warning("Binance WS: не нашёл bids/asks в сообщении, ключи=%s, сырое=%s",
+                            list(data.keys()), str(data)[:500])
+            return
 
-        raw_bids = data.get("bids", [])
-        raw_asks = data.get("asks", [])
-        bids = [(float(p), float(q)) for p, q in raw_bids]
-        asks = [(float(p), float(q)) for p, q in raw_asks]
+        try:
+            bids = [(float(p), float(q)) for p, q in raw_bids]
+            asks = [(float(p), float(q)) for p, q in raw_asks]
+        except (TypeError, ValueError) as e:
+            log.warning("Binance WS: не смог распарсить bids/asks (%s): %s", e, str(data)[:300])
+            return
 
-        return analyze_book(symbol, market.market_index, bids, asks,
+        snap = analyze_book(symbol, market.market_index, bids, asks,
                              CFG.binance_wall_min_usd, CFG.wall_max_distance_pct)
+        if snap is not None:
+            try:
+                self.events.put_nowait(snap)
+            except asyncio.QueueFull:
+                pass
 
     async def stop(self):
         if self._task:
