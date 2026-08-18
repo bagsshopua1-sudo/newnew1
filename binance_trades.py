@@ -128,6 +128,42 @@ class BinanceTradeFeed:
                 sell_usd += usd
         return {"buy_usd": buy_usd, "sell_usd": sell_usd, "total_usd": buy_usd + sell_usd}
 
+    def executed_usd_trend(self, symbol: str, price: float, distance_pct: float,
+                            lookback_sec: float = 8.0, buckets: int = 4) -> list:
+        """
+        То же самое, что executed_usd_near(), но БЕЗ схлопывания в одно число -
+        разбивает lookback_sec на `buckets` равных временных отрезков (от
+        старого к новому) и считает buy/sell USD в каждом отдельно. Один
+        суммарный snapshot не отличает "объём идёт с нарастанием" (агрессор
+        давит всё сильнее) от "был всплеск в начале окна и всё затихло" -
+        ровно то отличие, которое нужно, чтобы поймать давление, которое
+        "начинает ослабевать" (см. AUDIT_2026-08-18.md, этап 3 - критерий
+        ABSORPTION) или, наоборот, continuation flow после пробоя (этап 4).
+        Добавлено 18.08 (аудит стратегии, этап 1.4).
+        """
+        empty = [{"buy_usd": 0.0, "sell_usd": 0.0} for _ in range(max(buckets, 1))]
+        tape = self._tape.get(symbol)
+        if not tape or buckets < 1:
+            return empty
+        now = time.time()
+        window = min(lookback_sec, TAPE_KEEP_SEC)
+        start = now - window
+        bucket_width = window / buckets
+        max_dist = price * distance_pct / 100.0
+        result = [{"buy_usd": 0.0, "sell_usd": 0.0} for _ in range(buckets)]
+        for ts, p, usd, is_buy in tape:
+            if ts < start:
+                continue
+            if abs(p - price) > max_dist:
+                continue
+            idx = int((ts - start) / bucket_width)
+            idx = min(max(idx, 0), buckets - 1)
+            if is_buy:
+                result[idx]["buy_usd"] += usd
+            else:
+                result[idx]["sell_usd"] += usd
+        return result
+
     async def stop(self):
         if self._task:
             self._task.cancel()
