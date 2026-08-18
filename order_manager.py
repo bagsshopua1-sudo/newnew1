@@ -104,6 +104,14 @@ class ManagedPosition:
     # заработанного), не более одного раза за сделку.
     thesis_state: str = "VALID"
     weakening_partial_done: bool = False
+    # Счётчик подряд идущих тиков, где сравнение стенок в _thesis_invalidated
+    # (nearest_blocking >= nearest_holding * WALL_DOMINANCE_RATIO) было верным -
+    # ОТДЕЛЬНЫЙ от invalidation_streak. Найдено в проде 18.08 вечером: именно
+    # эта проверка мгновенно (за 1 тик) хлопала structure_invalidated на
+    # обычном дёрганье стенок в стакане, а общий invalidation_streak (всего
+    # 2 тика) не успевал это отфильтровать - серия 69 сделок за 26 минут по
+    # 8-40 сек, PnL -13.59. См. WALL_DOMINANCE_CONFIRM_TICKS в config.py.
+    wall_dominance_streak: int = 0
 
 
 class OrderManager:
@@ -636,12 +644,22 @@ class OrderManager:
         # блокирующая стенка тогда считается доминирующей.
         blocking_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
         holding_walls = snap.bid_walls if pos.side == "long" else snap.ask_walls
+        dominance_now = False
         if blocking_walls:
             nearest_blocking = min(blocking_walls, key=lambda w: w.distance_pct)
             nearest_holding = min(holding_walls, key=lambda w: w.distance_pct) if holding_walls else None
             holding_usd = nearest_holding.usd if nearest_holding else 0.0
-            if nearest_blocking.usd >= holding_usd * CFG.wall_dominance_ratio:
-                return True
+            dominance_now = nearest_blocking.usd >= holding_usd * CFG.wall_dominance_ratio
+        # Отдельный, собственный счётчик подряд идущих тиков для ЭТОЙ проверки
+        # (не общий invalidation_streak) - см. комментарий у
+        # pos.wall_dominance_streak. Разовое дёрганье стенки на 1 тик больше
+        # не хлопает structure_invalidated само по себе.
+        if dominance_now:
+            pos.wall_dominance_streak += 1
+        else:
+            pos.wall_dominance_streak = 0
+        if pos.wall_dominance_streak >= CFG.wall_dominance_confirm_ticks:
+            return True
 
         if pos.signal_type == "absorption":
             # Тезис: стенка держится и её ещё не пробили. Инвалидация - стенка
