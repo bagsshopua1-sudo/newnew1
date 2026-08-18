@@ -465,7 +465,29 @@ class OrderManager:
                     self._thesis_invalidated(pos, signal_snap, snap)
                 )
 
-                if thesis_invalid:
+                # Не режем УЖЕ прибыльную сделку по этой мягкой проверке (сравнение
+                # размера входной стенки со встречной, см. _thesis_invalidated) -
+                # она пересчитывается каждый тик и реагирует на обычное шумное
+                # дёрганье стенок в стакане (см. лог WALL_CANDIDATE: стенки
+                # появляются/пропадают за доли секунды сами по себе). На проде
+                # 18.08 из-за этого structure_invalidated закрывал 19 из 24 сделок
+                # за 10-30 секунд, почти никогда не давая дойти ни до TP1, ни до
+                # настоящего opposing_wall (за тот же прогон он сработал 1 раз) -
+                # винрейт был приличный (58%), но средний плюс всего ~0.5$ вместо
+                # потенциальных ~3.4$ до TP1. Если позиция уже сдвинулась в нашу
+                # пользу дальше "шумовой полосы" (используем тот же порог, что и
+                # для "стенку съели, цена стоит на месте" ниже в _thesis_invalidated -
+                # CFG.wall_eaten_flat_pct), это уже не мусорный шум - даём сделке
+                # доехать до TP1/трейлинга/opposing_wall (у него свой профит-порог
+                # и требование реальной новой встречной стенки). Если позиция в
+                # минусе или около нуля - invalidation работает как раньше,
+                # мгновенно (это по-прежнему главная защита от мёртвого тезиса).
+                exec_price = snap.mid if snap else pos.avg_entry
+                profit_pct = ((exec_price - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
+                    else ((pos.avg_entry - exec_price) / pos.avg_entry * 100)
+                already_profitable = profit_pct > CFG.wall_eaten_flat_pct
+
+                if thesis_invalid and not already_profitable:
                     pos.invalidation_streak += 1
                 else:
                     pos.invalidation_streak = 0
