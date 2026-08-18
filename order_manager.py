@@ -370,7 +370,7 @@ class OrderManager:
 
                 thesis_invalid = (
                     time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and
-                    self._thesis_invalidated(pos, signal_snap)
+                    self._thesis_invalidated(pos, signal_snap, snap)
                 )
 
                 if thesis_invalid:
@@ -388,10 +388,15 @@ class OrderManager:
         except asyncio.CancelledError:
             return
 
-    def _thesis_invalidated(self, pos: ManagedPosition, snap) -> bool:
+    def _thesis_invalidated(self, pos: ManagedPosition, snap, exec_snap=None) -> bool:
         """
         "Умный" выход: проверяет, жива ли ещё сама причина, по которой вошли в
         сделку - а не только цена относительно стопа/тейка.
+
+        exec_snap - стакан Lighter (та же цена, от которой avg_entry) - нужен
+        только для расчёта PnL в ветке "стенку съели, цена стоит на месте" ниже
+        (см. wall_eaten_flat_pct); остальные проверки в этой функции работают
+        по структуре signal_snap (snap), как и раньше.
         """
         if snap is None or not pos.reference_price:
             return False
@@ -426,8 +431,29 @@ class OrderManager:
             )
             price_broke_through = (snap.mid < pos.reference_price) if pos.side == "long" \
                 else (snap.mid > pos.reference_price)
-            if not still_there and price_broke_through:
-                return True
+            if not still_there:
+                if price_broke_through:
+                    # реальный слом структуры - цена уже прошла уровень стенки
+                    return True
+                # Стенка пропала (съедена реальным объёмом или снята), но цена
+                # ЕЩЁ НЕ пробила её уровень против нас - смотрим, куда цена
+                # успела уйти относительно входа (по exec_snap = Lighter, той
+                # же цене, что и avg_entry - иначе basis Binance/Lighter
+                # искажает расчёт, см. аналогичный комментарий у
+                # _opposing_wall_exit). Если цена стоит на месте (в пределах
+                # WALL_EATEN_FLAT_PCT) - держать больше нечего, повод для
+                # сделки исчез без какого-либо результата - выходим примерно
+                # в ноль, не дожидаясь ни тейка, ни стопа. Если же цена уже
+                # ушла в НАШУ пользу за пределы этой полосы - это не провал
+                # тезиса, а скорее его подтверждение (стенку съели и цена
+                # пошла куда надо - ровно на этом строится отдельный сигнал
+                # BREAKOUT в signals.py) - не режем прибыль, даём тейку/
+                # трейлингу отработать как обычно.
+                if exec_snap is not None:
+                    profit_pct = ((exec_snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
+                        else ((pos.avg_entry - exec_snap.mid) / pos.avg_entry * 100)
+                    if abs(profit_pct) <= CFG.wall_eaten_flat_pct:
+                        return True
             # дисбаланс резко развернулся против позиции - давление сменилось
             imb = snap.imbalance if pos.side == "long" else (1 - snap.imbalance)
             if imb < (1 - CFG.imbalance_threshold):
