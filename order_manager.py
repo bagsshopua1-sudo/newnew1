@@ -57,6 +57,10 @@ class ManagedPosition:
     # шум в стакане на долю секунды), а только после INVALIDATION_CONFIRM_TICKS
     # подтверждений подряд.
     invalidation_streak: int = 0
+    # Волатильность рынка на момент входа (Signal.volatility_pct) - используется
+    # для масштабирования opposing_wall_min_profit_pct под текущий режим рынка
+    # (см. _opposing_wall_exit) вместо одного фиксированного % на все случаи.
+    entry_volatility_pct: float = 0.0
 
 
 class OrderManager:
@@ -116,10 +120,17 @@ class OrderManager:
                           signal.symbol, CFG.max_reprice_attempts + 1)
                 return
 
+            # SL/TP1 в plan посчитаны от цены СИГНАЛА (до входа) - реальная цена
+            # исполнения (avg_entry) почти всегда отличается (basis Lighter/Binance
+            # + задержка между сигналом и ордером). Пересчитываем от факта, иначе
+            # структура сделки считается от точки, где вход на самом деле не было.
+            plan = self.risk.rebase_plan_to_fill(plan, avg_entry)
+
             pos = ManagedPosition(
                 symbol=signal.symbol, side=plan.side, market=market, plan=plan,
                 filled_size=filled_size, avg_entry=avg_entry, current_sl_price=plan.stop_price,
                 signal_type=signal.signal_type, reference_price=signal.reference_price,
+                entry_volatility_pct=signal.volatility_pct,
             )
             self.positions[signal.symbol] = pos
             if self.trade_log:
@@ -363,13 +374,20 @@ class OrderManager:
         сделку немедленно - и после round-trip проскальзывания на входе/выходе
         такое закрытие гарантированно давало убыток, что и наблюдалось в проде:
         первые два opposing_wall закрытия дали -0.47 и -0.35 вместо прибыли).
-        Требуем движение минимум на OPPOSING_WALL_MIN_PROFIT_PCT от цены входа.
+        Требуем движение минимум на OPPOSING_WALL_MIN_PROFIT_PCT от цены входа -
+        но это не фиксированное число для всех ситуаций: масштабируем порог
+        волатильностью рынка на момент входа (0.15% при спокойном рынке и при
+        резком движении - разные вещи, см. entry_volatility_pct/config.py).
         """
         if snap is None:
             return False
+        effective_min_profit_pct = max(
+            CFG.opposing_wall_min_profit_pct,
+            pos.entry_volatility_pct * CFG.opposing_wall_vol_multiplier,
+        )
         profit_pct = ((snap.mid - pos.avg_entry) / pos.avg_entry * 100) if pos.side == "long" \
             else ((pos.avg_entry - snap.mid) / pos.avg_entry * 100)
-        if profit_pct < CFG.opposing_wall_min_profit_pct:
+        if profit_pct < effective_min_profit_pct:
             return False
         # для лонга встречная стенка - на продажу (ask), для шорта - на покупку (bid)
         opposing_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
