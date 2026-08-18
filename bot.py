@@ -14,6 +14,7 @@ MODE=live    -> то же самое, но реальными деньгами �
 """
 import asyncio
 import logging
+import signal
 import time
 from typing import Dict
 
@@ -136,14 +137,55 @@ async def run_trading():
         market = markets[signal.symbol]
         asyncio.create_task(orders.handle_signal(market, signal))
 
+    # Грейсфул шатдаун: хостинг (Render и любой другой контейнерный PaaS) перед
+    # рестартом/редеплоем шлёт SIGTERM с коротким грейс-периодом, а не сразу
+    # SIGKILL. Без обработчика Python на SIGTERM завершается МГНОВЕННО, минуя
+    # весь finally ниже - открытая на этот момент позиция просто пропадает:
+    # в paper-режиме lighter.PaperClient целиком живёт в памяти процесса (см.
+    # exchange_client.py - создаётся заново на каждом старте с тем же
+    # initial_collateral_usdc), новый процесс стартует с чистого листа, а в
+    # trade_log остаётся запись сделки, у которой никогда не проставится exit.
+    # На Render free tier это особенно важно - процесс перезапускается сам по
+    # себе (без нового деплоя) в среднем каждые несколько минут. Ловим сигнал
+    # и закрываем позиции штатно (flatten_all), чтобы PnL хотя бы попал в
+    # журнал, прежде чем процесс всё равно умрёт при следующем рестарте.
+    shutdown_event = asyncio.Event()
+
+    def _on_shutdown_signal(sig_name: str):
+        if not shutdown_event.is_set():
+            log.warning("Получен сигнал %s - грейсфул шатдаун (закрываю открытые позиции перед выходом)",
+                        sig_name)
+            shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_shutdown_signal, sig.name)
+        except (NotImplementedError, RuntimeError):
+            pass  # платформы без поддержки add_signal_handler - не актуально на Render/Linux
+
     try:
         tasks = [asyncio.create_task(lighter_consumer())]
         if binance:
             tasks.append(asyncio.create_task(binance_consumer()))
-        await asyncio.gather(*tasks)
+        shutdown_task = asyncio.create_task(shutdown_event.wait())
+        done, pending = await asyncio.wait([*tasks, shutdown_task], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        # если завершилось не из-за сигнала (например consumer упал с исключением) -
+        # даём исключению всплыть наружу, как раньше делал asyncio.gather(*tasks)
+        for t in done:
+            if t is not shutdown_task:
+                t.result()
     except asyncio.CancelledError:
         pass
     finally:
+        if orders.positions:
+            log.warning("Грейсфул шатдаун: закрываю %d открытых позиций перед выходом", len(orders.positions))
+            try:
+                await orders.flatten_all("graceful_shutdown")
+            except Exception as e:
+                log.error("Не удалось закрыть позиции при грейсфул шатдауне: %s", e)
         await orders.shutdown()
         await md.stop()
         if binance:
