@@ -30,6 +30,7 @@ from risk import RiskManager
 from signals import SignalEngine
 from trade_log import TradeLog
 from trend_filter import TrendFilter
+from wall_event_log import WallEventLog
 
 log = logging.getLogger("bot")
 
@@ -39,6 +40,9 @@ async def run_trading():
     markets = await exchange.resolve_markets()
 
     trade_log = TradeLog()
+    # Персистентное хранилище WALL_CANDIDATE/WALL_OUTCOME/shadow_evals (аудит
+    # стратегии 18.08, этап 1.3) - см. wall_event_log.py.
+    wall_events = WallEventLog()
     kill_switch = KillSwitch()
     risk = RiskManager(on_breach=kill_switch.trigger)
 
@@ -57,7 +61,8 @@ async def run_trading():
                                        CFG.vol_lookback, CFG.vol_spike_mult,
                                        CFG.dead_range_lookback_sec, CFG.dead_range_min_pct,
                                        CFG.dead_range_min_coverage_sec) for sym in markets}
-    engines = {sym: SignalEngine(sym, trend_filter=trend_filters[sym], trade_feed=binance_trades)
+    engines = {sym: SignalEngine(sym, trend_filter=trend_filters[sym], trade_feed=binance_trades,
+                                  event_log=wall_events)
                for sym in markets}
 
     latest_lighter_snap: Dict[str, "BookSnapshot"] = {}
@@ -196,6 +201,7 @@ async def run_trading():
             await binance_trades.stop()
         await exchange.close()
         trade_log.close()
+        wall_events.close()
 
 
 async def main():
