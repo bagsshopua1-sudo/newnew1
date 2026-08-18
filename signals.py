@@ -51,8 +51,17 @@ PRICE_BUCKET_DECIMALS = 2  # группировка уровней стакан�
 # фактически ушла цена, независимо от того, прошёл кандидат фильтры или нет.
 # Так видно survivorship bias - что было бы, если бы фильтр пропустил и то, что он отсёк.
 _next_candidate_id = itertools.count(1)
-CANDIDATE_OUTCOME_DELAYS_SEC = (1.0, 3.0, 5.0)
+# Расширено 18.08 (аудит стратегии, этап 1.2) с (1.0, 3.0, 5.0) - три точки не
+# отличали "цена дёрнулась и откатила за первую секунду" от "устойчиво пошла
+# и продолжила" (нужно и для калибровки shadow-оценок в этапах 3/4, и для
+# понимания, на каком горизонте вообще есть статистический эдж).
+CANDIDATE_OUTCOME_DELAYS_SEC = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0)
 CANDIDATE_LOG_COOLDOWN_SEC = 5.0  # не спамить лог по одной и той же стенке каждые 100мс
+# Частота ABSORPTION/BREAKOUT сигналов - отдельный периодический лог (этап 1.5
+# аудита). Раньше эти цифры можно было получить только руками через grep по
+# логам Render - теперь есть и явная сводка, и (через wall_event_log.py)
+# запрашиваемая по type колонке история.
+FREQUENCY_LOG_INTERVAL_SEC = 300.0
 
 # Ширина "зоны" для истории отмен - в % от цены (не абсолютное число, чтобы
 # одинаково работало и для BTC (~64000), и для ETH (~3000)).
@@ -118,8 +127,14 @@ class _TrackedWall:
 
 class SignalEngine:
     def __init__(self, symbol: str, history_len: int = 30, trend_filter: TrendFilter = None,
-                 trade_feed=None):
+                 trade_feed=None, event_log=None):
         self.symbol = symbol
+        # Персистентное SQLite-хранилище WALL_CANDIDATE/WALL_OUTCOME/shadow_evals -
+        # см. wall_event_log.py (этап 1.3 аудита). None допустим (например, в
+        # юнит-тестах) - все обращения обёрнуты и не роняют сигнальную логику.
+        self.event_log = event_log
+        self._freq_counts = {"absorption": 0, "breakout": 0}
+        self._last_freq_log_ts = 0.0
         self.history: Deque[BookSnapshot] = deque(maxlen=history_len)
         self.tracked: Dict[float, _TrackedWall] = {}  # bucketed price -> _TrackedWall
         # стенка должна простоять хотя бы столько, чтобы считаться "реальной" -
@@ -255,22 +270,38 @@ class SignalEngine:
                     # реальный пробой: стенка простояла, была близко и цена через неё прошла.
                     # Пробой ПО тренду не фильтруем - фильтр только против контр-трендовых входов.
                     side = "long" if tw.wall.side == "ask" else "short"
-                    breakout_signal = Signal(
-                        symbol=self.symbol,
-                        side=side,
-                        signal_type="breakout",
-                        reference_price=tw.wall.price,
-                        mid=snap.mid,
-                        confidence=self._confidence(snap, side, boost=0.15),
-                        ts=now,
-                        volatility_pct=trend_state.volatility_pct,
-                        wall_usd=tw.wall.usd,
-                        backup_usd=tw.wall.backup_usd,
-                    )
-                    self._log_wall_candidate(tw, side, snap, age, passed=True, reason="",
-                                              signal_type="breakout")
-                    log.info("[%s] BREAKOUT %s у %.2f (стенка стояла %.1fs, %.0f USD)",
-                              self.symbol, side.upper(), tw.wall.price, age, tw.max_usd)
+                    # Спуфинг-гейт по истории отмен в этой зоне (этап 2.1 аудита,
+                    # 18.08) - zone_cancels_5m раньше только логировался в
+                    # WALL_SCORE, ни на что не влияя. Порог не откалиброван по
+                    # выборке (первая прикидка, как и DEAD_RANGE_MIN_PCT в своё
+                    # время) - см. CFG.spoof_zone_cancel_max, отсечённые кандидаты
+                    # по-прежнему логируются (reason=spoof_zone_cancels), чтобы
+                    # можно было измерить, сколько реально отсекается и куда шла
+                    # цена по факту.
+                    zone_cancels_here = self._zone_cancel_count(tw.wall.side, tw.wall.price)
+                    if zone_cancels_here >= CFG.spoof_zone_cancel_max:
+                        log.info("[%s] BREAKOUT %s у %.2f ПРОПУЩЕН: подозрение на спуфинг зоны "
+                                  "(%d отмен за 5 мин >= %d)", self.symbol, side.upper(), tw.wall.price,
+                                  zone_cancels_here, CFG.spoof_zone_cancel_max)
+                        self._log_wall_candidate(tw, side, snap, age, passed=False,
+                                                  reason="spoof_zone_cancels", signal_type="breakout")
+                    else:
+                        breakout_signal = Signal(
+                            symbol=self.symbol,
+                            side=side,
+                            signal_type="breakout",
+                            reference_price=tw.wall.price,
+                            mid=snap.mid,
+                            confidence=self._confidence(snap, side, boost=0.15),
+                            ts=now,
+                            volatility_pct=trend_state.volatility_pct,
+                            wall_usd=tw.wall.usd,
+                            backup_usd=tw.wall.backup_usd,
+                        )
+                        self._log_wall_candidate(tw, side, snap, age, passed=True, reason="",
+                                                  signal_type="breakout")
+                        log.info("[%s] BREAKOUT %s у %.2f (стенка стояла %.1fs, %.0f USD)",
+                                  self.symbol, side.upper(), tw.wall.price, age, tw.max_usd)
                 else:
                     # похоже на спуфинг (сняли заявку) или стенка была далеко от рынка.
                     # Если была близко - фиксируем как отмену в этой зоне (для spoof
@@ -292,12 +323,15 @@ class SignalEngine:
         if breakout_signal:
             return breakout_signal
 
-        if False and trend_state.is_dead:
-            # ОТКЛЮЧЕНО по прямой просьбе пользователя 18.08 - резало частоту
-            # сделок намного сильнее, чем ожидалось (несколько минут полной
-            # тишины подряд), доказанного улучшения по прибыли на маленькой
-            # выборке не показал. Код оставлен (просто "if False and ..."),
-            # чтобы можно было включить обратно одной правкой, если понадобится.
+        if trend_state.is_dead:
+            # Было отключено 18.08 (см. git-историю) по жалобе, что резало
+            # частоту сильнее ожидаемого при неубедительном профите на
+            # маленькой выборке. Включено обратно 18.08 по прямому запросу
+            # аудита стратегии (этап 2.2, "убрать очевидный мусор") - логика
+            # верна по построению (подтверждено реальными логами - см.
+            # AUDIT_2026-08-18.md) и глушит именно тот класс сделок, что риск-
+            # менеджмент всё равно не умеет отличить от нормального сигнала.
+            # Если снова захотим отключить - меняем на "if False and ...".
             # "Мёртвый" рынок - см. TrendState.is_dead/CFG.dead_range_min_pct.
             # Не глушим BREAKOUT (он уже отработан выше, до этой проверки) -
             # пробой сам по себе означает, что цена ТОЛЬКО ЧТО вышла из
@@ -346,6 +380,17 @@ class SignalEngine:
                     # внутри одной группы почти одновременных снепшотов, просто с
                     # другим текстом лога - обнаружено в проде после первого
                     # раунда фикса (дебаунс тогда стоял только на пути success).
+                    tw.last_signal_ts = now
+                    continue
+                # Тот же спуфинг-гейт, что и у BREAKOUT выше (этап 2.1 аудита) -
+                # см. комментарий там.
+                zone_cancels_here = self._zone_cancel_count(tw.wall.side, tw.wall.price)
+                if zone_cancels_here >= CFG.spoof_zone_cancel_max:
+                    log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: подозрение на спуфинг зоны "
+                              "(%d отмен за 5 мин >= %d)", self.symbol, side.upper(), tw.wall.price,
+                              zone_cancels_here, CFG.spoof_zone_cancel_max)
+                    self._log_wall_candidate(tw, side, snap, age, passed=False, reason="spoof_zone_cancels")
+                    tw.stall_count = 0
                     tw.last_signal_ts = now
                     continue
                 sig = Signal(
@@ -415,10 +460,24 @@ class SignalEngine:
         tw.last_candidate_log_ts = now
 
         executed = {"buy_usd": 0.0, "sell_usd": 0.0, "total_usd": 0.0}
+        # trend-бакеты (этап 1.4 аудита) - последняя половина lookback-окна vs
+        # вся история, чтобы отличать нарастающий поток от затухающего (см.
+        # BinanceTradeFeed.executed_usd_trend). Используются в этапах 3/4 для
+        # shadow-оценки "давление ослабевает"/"continuation flow", здесь пока
+        # только логируются вместе с кандидатом.
+        buy_recent = sell_recent = 0.0
         if self.trade_feed is not None:
             try:
+                lookback = min(age, 30.0)
                 executed = self.trade_feed.executed_usd_near(
-                    self.symbol, tw.wall.price, CFG.wall_backup_range_pct, min(age, 30.0))
+                    self.symbol, tw.wall.price, CFG.wall_backup_range_pct, lookback)
+                trend_buckets = self.trade_feed.executed_usd_trend(
+                    self.symbol, tw.wall.price, CFG.wall_backup_range_pct,
+                    lookback_sec=min(lookback, 10.0), buckets=4)
+                half = len(trend_buckets) // 2
+                recent_buckets = trend_buckets[half:] if half else trend_buckets
+                buy_recent = sum(b["buy_usd"] for b in recent_buckets)
+                sell_recent = sum(b["sell_usd"] for b in recent_buckets)
             except Exception:
                 pass  # калибровочный лог не должен ронять основную логику сигналов
 
@@ -431,16 +490,41 @@ class SignalEngine:
         log.info(
             "[%s] WALL_CANDIDATE id=%d type=%s side=%s price=%.2f size_usd=%.0f backup_usd=%.0f "
             "age=%.1fs stall=%d updates=%d refills=%d class=%s executed_buy=%.0f executed_sell=%.0f "
-            "zone_cancels_5m=%d score=%.3f passed=%s reason=%s mid=%.2f",
+            "executed_buy_recent=%.0f executed_sell_recent=%.0f zone_cancels_5m=%d score=%.3f "
+            "passed=%s reason=%s mid=%.2f",
             self.symbol, cid, signal_type, side, tw.wall.price, tw.wall.usd, tw.wall.backup_usd,
             age, tw.stall_count, tw.update_count, tw.refill_count, wall_class,
-            executed["buy_usd"], executed["sell_usd"], zone_cancels, score, passed, reason, mid0,
+            executed["buy_usd"], executed["sell_usd"], buy_recent, sell_recent,
+            zone_cancels, score, passed, reason, mid0,
         )
+        if self.event_log is not None:
+            self.event_log.log_candidate(
+                cid, self.symbol, signal_type, side, tw.wall.price, tw.wall.usd, tw.wall.backup_usd,
+                age, tw.stall_count, tw.update_count, tw.refill_count, wall_class,
+                executed["buy_usd"], executed["sell_usd"], buy_recent, sell_recent,
+                zone_cancels, score, passed, reason, mid0,
+            )
+        if passed:
+            self._freq_counts[signal_type] = self._freq_counts.get(signal_type, 0) + 1
+        self._maybe_log_frequency_summary(now)
+
         for delay in CANDIDATE_OUTCOME_DELAYS_SEC:
             try:
                 asyncio.create_task(self._log_candidate_outcome(cid, mid0, side, delay))
             except RuntimeError:
                 pass  # нет активного event loop (например, юнит-тест вне asyncio) - пропускаем
+
+    def _maybe_log_frequency_summary(self, now: float):
+        """Отдельная периодическая сводка частоты ABSORPTION vs BREAKOUT (этап
+        1.5 аудита) - раньше это можно было увидеть только руками, посчитав
+        вхождения type= в текстовых логах."""
+        if now - self._last_freq_log_ts < FREQUENCY_LOG_INTERVAL_SEC:
+            return
+        self._last_freq_log_ts = now
+        log.info("[%s] FREQUENCY за последние ~%.0fs: absorption=%d breakout=%d",
+                  self.symbol, FREQUENCY_LOG_INTERVAL_SEC,
+                  self._freq_counts.get("absorption", 0), self._freq_counts.get("breakout", 0))
+        self._freq_counts = {"absorption": 0, "breakout": 0}
 
     async def _log_candidate_outcome(self, cid: int, mid0: float, side: str, delay: float):
         await asyncio.sleep(delay)
@@ -451,3 +535,5 @@ class SignalEngine:
         favorable = delta_pct > 0 if side == "long" else delta_pct < 0
         log.info("[%s] WALL_OUTCOME id=%d t=+%.0fs mid=%.2f delta_pct=%.4f favorable=%s",
                   self.symbol, cid, delay, mid_now, delta_pct, favorable)
+        if self.event_log is not None:
+            self.event_log.log_outcome(cid, delay, mid_now, delta_pct, favorable)
