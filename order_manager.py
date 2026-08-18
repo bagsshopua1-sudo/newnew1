@@ -72,6 +72,20 @@ class ManagedPosition:
     # _watch_position) - тихо теряли профит-тейк на тонком стакане. Теперь
     # TP1 считается выполненным только когда реально закрыт весь tp1_size.
     tp1_filled: float = 0.0
+    # Причина закрытия, которое УЖЕ решено сделать, но последняя попытка не
+    # исполнилась целиком (см. close_stall_count) - см. _watch_position.
+    # Найдено в проде 18.08 (ETH): после неудачной попытки закрытия по
+    # structure_invalidated invalidation_streak сбрасывался в 0, и следующая
+    # попытка закрытия ждала, пока тезис заново "развалится" 2 тика подряд -
+    # на практике это растягивало интервал между попытками закрытия до
+    # ~17-19 секунд вместо штатной 1 секунды (POSITION_CHECK_INTERVAL_SEC),
+    # хотя решение закрыться уже было принято и отменять его никто не
+    # собирался. За это время цена продолжала уходить против уже
+    # "приговорённой" позиции - итоговый убыток (-6.35 USD на ETH) получился
+    # заметно больше, чем должен был дать сам стоп. Теперь если закрытие уже
+    # начато, но не исполнилось целиком - следующая попытка идёт на САМОМ
+    # СЛЕДУЮЩЕМ тике с той же причиной, без повторного набора подтверждений.
+    pending_close_reason: Optional[str] = None
 
 
 class OrderManager:
@@ -200,11 +214,15 @@ class OrderManager:
                           signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
                 self._last_reversal_ts[signal.symbol] = time.time()
                 snap = self._latest_snap.get(signal.symbol)
+                existing.pending_close_reason = "reversal_signal"
                 await self._close_position_safely(existing, snap, "reversal_signal")
                 if self.has_position(signal.symbol):
                     # Закрытие исполнилось не полностью (paper: не пересекло спред) -
                     # остаток всё ещё числится открытым, новую позицию поверх не
-                    # открываем, следующий тик _watch_position дозакроет хвост.
+                    # открываем. pending_close_reason выставлен выше - следующий тик
+                    # _watch_position реально дозакроет хвост той же причиной, а не
+                    # будет заново ждать штатных условий выхода (см. комментарий у
+                    # ManagedPosition.pending_close_reason).
                     return
                 watcher = self._watchers.pop(signal.symbol, None)
                 if watcher:
@@ -378,8 +396,21 @@ class OrderManager:
                     continue
                 price = snap.mid
 
+                # Закрытие уже решено раньше, но не исполнилось целиком - см.
+                # ManagedPosition.pending_close_reason. Повторяем ТУ ЖЕ причину
+                # немедленно на этом тике, а не заново проверяем стоп/тейк/
+                # тезис с нуля - решение закрыться уже принято, тут только
+                # добиваем исполнение (буфер пересечения спреда сам
+                # эскалируется в _close_price с каждой попыткой).
+                if pos.pending_close_reason is not None:
+                    await self._close_position_safely(pos, snap, pos.pending_close_reason)
+                    if not self.has_position(pos.symbol):
+                        return
+                    continue
+
                 hit_stop = (price <= pos.current_sl_price) if pos.side == "long" else (price >= pos.current_sl_price)
                 if hit_stop:
+                    pos.pending_close_reason = "stop_loss"
                     await self._close_position_safely(pos, snap, "stop_loss")
                     if not self.has_position(pos.symbol):
                         return
@@ -422,6 +453,7 @@ class OrderManager:
                 # откатить обратно и прибыль превращается в убыток (см. коммент к
                 # OPPOSING_WALL_MIN_PROFIT_PCT в config.py - именно так и было в проде).
                 if self._opposing_wall_exit(pos, signal_snap, snap):
+                    pos.pending_close_reason = "opposing_wall"
                     await self._close_position_safely(pos, snap, "opposing_wall")
                     if not self.has_position(pos.symbol):
                         return
@@ -439,6 +471,7 @@ class OrderManager:
                     pos.invalidation_streak = 0
 
                 if pos.invalidation_streak >= CFG.invalidation_confirm_ticks:
+                    pos.pending_close_reason = "structure_invalidated"
                     await self._close_position_safely(pos, snap, "structure_invalidated")
                     if not self.has_position(pos.symbol):
                         return
