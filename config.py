@@ -96,6 +96,10 @@ class Config:
     # входа, прежде чем встречная стенка вообще рассматривается как повод
     # зафиксировать прибыль.
     opposing_wall_min_profit_pct: float = field(default_factory=lambda: _f("OPPOSING_WALL_MIN_PROFIT_PCT", 0.15))
+    # Порог фиксации прибыли по встречной стенке не должен быть одним и тем же
+    # числом при спокойном рынке и при резком движении. Реальный требуемый порог =
+    # max(OPPOSING_WALL_MIN_PROFIT_PCT, волатильность_на_входе * этот множитель).
+    opposing_wall_vol_multiplier: float = field(default_factory=lambda: _f("OPPOSING_WALL_VOL_MULTIPLIER", 1.0))
 
     # === Проверка "подложки" за стенкой (бот сам отсеивает слабые сигналы) ===
     # Крупная стенка на входе - ещё не гарантия, что она удержит цену: если
