@@ -71,6 +71,7 @@ class Dashboard:
         self.app.router.add_get("/api/status", self.handle_status)
         self.app.router.add_post("/api/kill", self.handle_kill)
         self.app.router.add_post("/api/resume", self.handle_resume)
+        self.app.router.add_post("/api/reset_account", self.handle_reset_account)
 
     def _status_dict(self):
         positions = []
@@ -107,6 +108,17 @@ class Dashboard:
 
     async def handle_resume(self, request):
         self.kill_switch.reset()
+        return web.json_response({"ok": True})
+
+    async def handle_reset_account(self, request):
+        """Сброс счёта бота (баланс/позиции/история сделок) с дашборда - см.
+        OrderManager.reset_account. Только paper - в live своя реальная биржа,
+        "сбросить баланс" там не бывает, и кнопка на дашборде для live не
+        показывается вовсе (см. INDEX_HTML), но проверяем и на сервере -
+        нельзя полагаться только на то, что скрыто в UI."""
+        if self.mode != "paper":
+            return web.json_response({"ok": False, "error": "доступно только в paper-режиме"}, status=400)
+        await self.orders.reset_account("manual (dashboard)")
         return web.json_response({"ok": True})
 
     async def handle_index(self, request):
@@ -160,7 +172,7 @@ INDEX_HTML = """<!doctype html>
   .kill-banner { background:linear-gradient(180deg,#2a1219,#20101a); border:1px solid #4a1f2a;
     color:#ffb3bf; padding:12px 16px; border-radius:12px; margin-bottom:18px; font-size:13.5px;
     display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-  .toolbar { display:flex; justify-content:flex-end; margin-bottom:18px; }
+  .toolbar { display:flex; justify-content:flex-end; gap:10px; margin-bottom:18px; }
 
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
@@ -195,6 +207,7 @@ INDEX_HTML = """<!doctype html>
     font-weight:600; cursor:pointer; font-size:13px; transition:opacity .15s; }
   button.resume { background:var(--green); color:#08130d; }
   button.ghost { background:transparent; border:1px solid var(--border); color:var(--muted); }
+  button.ghost.reset { border-color:var(--amber); color:var(--amber); }
   button:hover { opacity:.85; }
 
   .event-line { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px;
@@ -273,6 +286,13 @@ async function resumeBot() {
   await fetch('/api/resume', {method:'POST'});
   refresh();
 }
+async function resetAccount() {
+  if (!confirm('Сбросить счёт бота?\n\nБаланс вернётся к стартовому, все открытые позиции будут закрыты, а ВСЯ история сделок удалится безвозвратно. Это нельзя отменить.')) return;
+  const r = await fetch('/api/reset_account', {method:'POST'});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok === false) { alert('Не удалось сбросить счёт' + (j.error ? ': ' + j.error : '')); }
+  refresh();
+}
 
 function renderChart(curve) {
   const svg = document.getElementById('chartSvg');
@@ -336,15 +356,21 @@ async function refresh() {
 
   const killBanner = document.getElementById('killBanner');
   const toolbar = document.getElementById('toolbar');
+  let toolbarHtml = '';
   if (s.kill_switch_active) {
     killBanner.innerHTML = `<div class="kill-banner">
       <span>⛔ <b>Kill switch активен</b> (${s.kill_switch_reason}) — новые входы заблокированы</span>
       <button class="resume" onclick="resumeBot()">Возобновить торговлю</button></div>`;
-    toolbar.innerHTML = '';
   } else {
     killBanner.innerHTML = '';
-    toolbar.innerHTML = `<button class="ghost" onclick="killSwitch()">⛔ Аварийная остановка</button>`;
+    toolbarHtml += `<button class="ghost" onclick="killSwitch()">⛔ Аварийная остановка</button>`;
   }
+  // Сброс счёта - только paper (в live своя реальная биржа, сервер тоже это
+  // проверяет и отклонит запрос, см. Dashboard.handle_reset_account).
+  if (s.mode === 'paper') {
+    toolbarHtml += `<button class="ghost reset" onclick="resetAccount()">🔄 Сбросить счёт</button>`;
+  }
+  toolbar.innerHTML = toolbarHtml;
 
   const pnlClass = s.equity_usd >= s.day_start_equity_usd ? 'pos-val' : 'neg-val';
   document.getElementById('statCards').innerHTML = `
