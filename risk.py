@@ -169,6 +169,20 @@ class RiskManager:
         plan.tp1_price = new_tp1
         return plan
 
+    def reset(self):
+        """Полный сброс статистики риск-менеджера - см. OrderManager.reset_account
+        (сброс счёта бота с дашборда). Возвращает equity/серию убытков к
+        стартовому состоянию, как при холодном старте процесса."""
+        self.equity = CFG.account_equity_usd
+        self.day_start_equity = CFG.account_equity_usd
+        self.day_key = time.strftime("%Y-%m-%d")
+        self.consecutive_losses = 0
+        self.cooldown_until = None
+        self.closed_trades = []
+        self._daily_breach_notified = False
+        self._streak_breach_notified = False
+        log.warning("RiskManager сброшен: equity=%.2f USD", self.equity)
+
     def register_close(self, symbol: str, side: str, pnl_usd: float):
         self.equity += pnl_usd
         self.closed_trades.append(ClosedTrade(symbol=symbol, side=side, pnl_usd=pnl_usd))
