@@ -121,7 +121,7 @@ class BinanceFeed:
             return
 
         snap = analyze_book(symbol, market.market_index, bids, asks,
-                             CFG.binance_wall_min_usd, CFG.wall_max_distance_pct)
+                             CFG.binance_wall_min_usd, CFG.wall_max_distance_pct, CFG.wall_backup_range_pct)
         if snap is not None:
             try:
                 self.events.put_nowait(snap)
