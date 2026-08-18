@@ -103,6 +103,12 @@ class OrderManager:
         # structure_invalidated) - см. CFG.reentry_cooldown_sec в handle_signal.
         # НЕ трогаем при reversal_signal - это отдельный, намеренный разворот.
         self._last_close_ts: Dict[str, float] = {}
+        # Когда символ последний раз РАЗВОРАЧИВАЛСЯ (сигнал против открытой
+        # позиции) - см. CFG.reversal_cooldown_sec в handle_signal. Отдельно
+        # от _last_close_ts выше: тот кулдаун не действует на развороты
+        # вообще, а этот действует ТОЛЬКО на них - защита от серии мгновенных
+        # флипов подряд в боковике (найдено в проде 18.08).
+        self._last_reversal_ts: Dict[str, float] = {}
 
     def note_snapshot(self, snap):
         self._latest_snap[snap.symbol] = snap
@@ -176,8 +182,23 @@ class OrderManager:
                 # потом цена падает и закрывает в минус". Закрываем НЕМЕДЛЕННО по
                 # рынку, без debounce (как и _opposing_wall_exit) - раз структура
                 # уже развернулась, ждать нет смысла, только отдаём движение.
+                # Кулдаун на ПОВТОРНЫЙ разворот - см. CFG.reversal_cooldown_sec и
+                # комментарий у self._last_reversal_ts в __init__. Первый разворот
+                # всегда мгновенный (как и раньше) - ограничиваем только частоту
+                # повторных, чтобы не флипаться туда-сюда в боковике.
+                last_reversal = self._last_reversal_ts.get(signal.symbol)
+                if last_reversal is not None:
+                    since_reversal = time.time() - last_reversal
+                    if since_reversal < CFG.reversal_cooldown_sec:
+                        log.info("[%s] разворот пропущен: кулдаун после предыдущего разворота "
+                                  "(%.0fs назад из %.0fs) - позиция %s остаётся как есть",
+                                  signal.symbol, since_reversal, CFG.reversal_cooldown_sec,
+                                  existing.side.upper())
+                        return
+
                 log.info("[%s] РАЗВОРОТ: сигнал %s (%s) против открытой позиции %s - закрываем немедленно",
                           signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
+                self._last_reversal_ts[signal.symbol] = time.time()
                 snap = self._latest_snap.get(signal.symbol)
                 await self._close_position_safely(existing, snap, "reversal_signal")
                 if self.has_position(signal.symbol):
@@ -895,6 +916,7 @@ class OrderManager:
             self.trade_log.reset()
 
         self._last_close_ts.clear()
+        self._last_reversal_ts.clear()
         self._entering.clear()
 
         if self.kill_switch and self.kill_switch.active:
