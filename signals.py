@@ -32,6 +32,7 @@
 """
 import asyncio
 import itertools
+import json
 import logging
 import time
 from collections import deque
@@ -284,7 +285,8 @@ class SignalEngine:
                                   "(%d отмен за 5 мин >= %d)", self.symbol, side.upper(), tw.wall.price,
                                   zone_cancels_here, CFG.spoof_zone_cancel_max)
                         self._log_wall_candidate(tw, side, snap, age, passed=False,
-                                                  reason="spoof_zone_cancels", signal_type="breakout")
+                                                  reason="spoof_zone_cancels", signal_type="breakout",
+                                                  price_crossed=True, is_wall_disappearance=True)
                     else:
                         breakout_signal = Signal(
                             symbol=self.symbol,
@@ -299,7 +301,8 @@ class SignalEngine:
                             backup_usd=tw.wall.backup_usd,
                         )
                         self._log_wall_candidate(tw, side, snap, age, passed=True, reason="",
-                                                  signal_type="breakout")
+                                                  signal_type="breakout", price_crossed=True,
+                                                  is_wall_disappearance=True)
                         log.info("[%s] BREAKOUT %s у %.2f (стенка стояла %.1fs, %.0f USD)",
                                   self.symbol, side.upper(), tw.wall.price, age, tw.max_usd)
                 else:
@@ -311,7 +314,8 @@ class SignalEngine:
                         side = "short" if tw.wall.side == "ask" else "long"  # сторона, которую бы "фейдили"
                         self._record_cancel(tw)
                         self._log_wall_candidate(tw, side, snap, age, passed=False,
-                                                  reason="cancelled_no_breakout")
+                                                  reason="cancelled_no_breakout", price_crossed=False,
+                                                  is_wall_disappearance=True)
                 del self.tracked[key]
 
         for key, w in seen_now.items():
@@ -452,11 +456,83 @@ class SignalEngine:
                  0.15 * backup_component + 0.2 * executed_component + 0.15) - 0.2 * spoof_penalty
         return max(0.0, min(1.0, score))
 
+    def _absorption_shadow_eval(self, tw: "_TrackedWall", side: str, executed_buy: float, executed_sell: float,
+                                 buy_recent: float, sell_recent: float, zone_cancels: int) -> Tuple[bool, dict]:
+        """
+        Этап 3 аудита - НЕ гейт, только теневая (WOULD_ENTER/WOULD_SKIP) оценка
+        новых критериев ABSORPTION для последующего сравнения с реальным
+        WALL_OUTCOME (см. AUDIT_2026-08-18.md). Условия по прямому списку из
+        запроса: реальная крупная стенка, есть aggressive flow В стенку, стенка
+        держится, есть refill, давление начинает ослабевать, spoof risk низкий -
+        просто существования стенки недостаточно.
+        """
+        # "Атакующий" агрессорский поток - та сторона тейпа, что реально давит
+        # НА стенку: для ask-стенки (блокирует движение вверх) это покупки, для
+        # bid-стенки - продажи.
+        attacking_total = executed_buy if tw.wall.side == "ask" else executed_sell
+        attacking_recent = buy_recent if tw.wall.side == "ask" else sell_recent
+        attacking_older = max(attacking_total - attacking_recent, 0.0)
+
+        criteria = {
+            "real_wall": tw.wall.usd >= self.base_wall_min_usd,
+            "aggressive_flow_into_wall": attacking_total >= tw.wall.usd * CFG.shadow_min_executed_ratio,
+            "wall_holds": tw.update_count >= CFG.absorption_stall_ticks,
+            "refill": tw.refill_count >= 1,
+            # давление ослабевает: недавняя половина окна кормит стенку заметно
+            # меньше, чем более старая половина (после того как поток вообще был).
+            "pressure_weakening": (
+                attacking_older > 0 and attacking_recent <= attacking_older * CFG.shadow_weakening_flow_ratio
+            ),
+            "spoof_risk_low": zone_cancels < CFG.spoof_zone_cancel_max,
+        }
+        return all(criteria.values()), criteria
+
+    def _breakout_shadow_eval(self, tw: "_TrackedWall", side: str, age: float, executed_buy: float,
+                               executed_sell: float, buy_recent: float, sell_recent: float,
+                               zone_cancels: int, price_crossed: bool) -> Tuple[bool, dict]:
+        """
+        Этап 4 аудита - НЕ гейт, теневая оценка новых критериев BREAKOUT.
+        Исчезновение стенки САМО ПО СЕБЕ не считается пробоем - нужно
+        подтверждение реальным исполненным объёмом, что стенку именно съели
+        (а не сняли/отодвинули), продолжение потока в сторону движения, и
+        отсутствие признаков немедленного возврата уровня (приближается через
+        zone_cancels - см. докстринг ниже, это приближение).
+        """
+        total_executed = executed_buy + executed_sell
+        # continuation flow - поток В СТОРОНУ предполагаемого движения ПОСЛЕ
+        # пробоя: long (стенка была ask, съедена вверх) - покупки должны
+        # доминировать в недавнем окне; short - продажи.
+        continuation_recent = buy_recent if side == "long" else sell_recent
+        opposite_recent = sell_recent if side == "long" else buy_recent
+
+        criteria = {
+            "wall_existed_long_enough": age >= CFG.shadow_breakout_min_age_sec,
+            "real_executed_volume": total_executed >= tw.max_usd * CFG.shadow_breakout_min_executed_ratio,
+            "wall_actually_eaten": total_executed >= tw.max_usd * CFG.shadow_breakout_eaten_ratio,
+            "price_passed_level": price_crossed,
+            # Приближение "не было мгновенного refill" - используем ту же
+            # историю отмен по зоне (zone_cancels), а не прямое наблюдение за
+            # тем, появился ли уровень заново через N секунд (это потребовало
+            # бы отдельного forward-looking трекинга, которого сейчас нет) -
+            # НЕДОСТАТОК, если понадобится точнее - надо добавить отдельный
+            # трекер "уровень появился снова в течение Xс после пробоя".
+            "no_recent_spoof_history": zone_cancels < CFG.spoof_zone_cancel_max,
+            "continuation_flow": continuation_recent > opposite_recent,
+        }
+        return all(criteria.values()), criteria
+
     def _log_wall_candidate(self, tw: "_TrackedWall", side: str, snap: BookSnapshot, age: float,
-                             passed: bool, reason: str, signal_type: str = "absorption"):
+                             passed: bool, reason: str, signal_type: str = "absorption",
+                             price_crossed: bool = False, is_wall_disappearance: bool = False) -> Optional[int]:
+        """Возвращает id залогированного кандидата (для привязки shadow_evals -
+        см. этапы 3/4 аудита) или None, если лог пропущен из-за дебаунса.
+        is_wall_disappearance=True - вызов из ветки "стенка пропала" (реальный
+        BREAKOUT или cancelled_no_breakout), а не из ABSORPTION stall-цикла -
+        именно на этом множестве событий имеет смысл breakout_v2 shadow-оценка
+        (см. _breakout_shadow_eval)."""
         now = time.time()
         if now - tw.last_candidate_log_ts < CANDIDATE_LOG_COOLDOWN_SEC:
-            return  # не спамить - одна и та же стенка иначе логируется каждые ~100-300мс
+            return None  # не спамить - одна и та же стенка иначе логируется каждые ~100-300мс
         tw.last_candidate_log_ts = now
 
         executed = {"buy_usd": 0.0, "sell_usd": 0.0, "total_usd": 0.0}
@@ -508,11 +584,32 @@ class SignalEngine:
             self._freq_counts[signal_type] = self._freq_counts.get(signal_type, 0) + 1
         self._maybe_log_frequency_summary(now)
 
+        # Shadow-оценка новой ABSORPTION/BREAKOUT логики (этапы 3/4 аудита) -
+        # считается для КАЖДОГО кандидата (не только тех, что прошли текущие
+        # гейты), чтобы можно было сравнить WOULD_ENTER с реальным
+        # WALL_OUTCOME по той же cid независимо от решения текущей логики.
+        # НЕ влияет на sig/breakout_signal - только логирование.
+        if self.event_log is not None:
+            try:
+                if is_wall_disappearance:
+                    would_enter_b, criteria_b = self._breakout_shadow_eval(
+                        tw, side, age, executed["buy_usd"], executed["sell_usd"],
+                        buy_recent, sell_recent, zone_cancels, price_crossed)
+                    self.event_log.log_shadow_eval(cid, "breakout_v2", would_enter_b, json.dumps(criteria_b))
+                else:
+                    would_enter, criteria = self._absorption_shadow_eval(
+                        tw, side, executed["buy_usd"], executed["sell_usd"],
+                        buy_recent, sell_recent, zone_cancels)
+                    self.event_log.log_shadow_eval(cid, "absorption_v2", would_enter, json.dumps(criteria))
+            except Exception:
+                pass  # shadow-логирование не должно ронять основную логику сигналов
+
         for delay in CANDIDATE_OUTCOME_DELAYS_SEC:
             try:
                 asyncio.create_task(self._log_candidate_outcome(cid, mid0, side, delay))
             except RuntimeError:
                 pass  # нет активного event loop (например, юнит-тест вне asyncio) - пропускаем
+        return cid
 
     def _maybe_log_frequency_summary(self, now: float):
         """Отдельная периодическая сводка частоты ABSORPTION vs BREAKOUT (этап
