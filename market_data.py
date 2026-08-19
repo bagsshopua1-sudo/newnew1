@@ -69,6 +69,18 @@ class BookSnapshot:
     bid_volume_near: float
     ask_volume_near: float
     imbalance: float  # 0..1, доля бидов в объёме bid+ask вблизи мида
+    # Microprice - "справедливая" цена, взвешенная размером противоположной
+    # стороны топа стакана: (best_bid*ask_size + best_ask*bid_size) / (ask_size+bid_size).
+    # Добавлено 19.08 (финальный этап рестройки стратегии) по прямому запросу
+    # пользователя - один из входных факторов классификации события ликвидности,
+    # который НЕ виден в голом mid=(bid+ask)/2. Интерпретация: чем крупнее
+    # displayed-объём на bid относительно ask, тем сильнее microprice тянет к
+    # ask (и наоборот) - это опережающий индикатор давления ДО того, как оно
+    # реально сдвинет mid (см. signals.py: _microprice_bias/_microprice_weakening
+    # используют это как независимое от executed-тейпа подтверждение "давление
+    # ослабевает/нарастает" при классификации ABSORPTION/BREAKOUT). Если размеры
+    # на обеих сторонах топа нулевые (не должно происходить в норме) - совпадает с mid.
+    microprice: float = 0.0
     ts: float = field(default_factory=time.time)
 
 
@@ -90,6 +102,15 @@ def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tupl
     mid = (best_bid + best_ask) / 2
     if mid <= 0:
         return None
+
+    # Microprice - см. докстринг BookSnapshot.microprice. best_bid_size/best_ask_size -
+    # displayed-размер на самом верхнем уровне каждой стороны (не usd, сырое
+    # количество монет - вес именно по размеру, не по стоимости).
+    best_bid_size = bids[0][1]
+    best_ask_size = asks[0][1]
+    size_sum = best_bid_size + best_ask_size
+    microprice = ((best_bid * best_ask_size + best_ask * best_bid_size) / size_sum
+                  if size_sum > 0 else mid)
 
     max_dist = wall_max_distance_pct / 100.0
     backup_range = wall_backup_range_pct / 100.0
@@ -134,6 +155,7 @@ def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tupl
         bid_volume_near=bid_vol,
         ask_volume_near=ask_vol,
         imbalance=imbalance,
+        microprice=microprice,
     )
 
 
