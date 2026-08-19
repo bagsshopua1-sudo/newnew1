@@ -69,6 +69,19 @@ class BinanceTradeFeed:
         return f"{WS_BASE}?streams={streams}"
 
     async def _run_with_reconnect(self):
+        # ВАЖНО (диагностика 19.08): раньше здесь был "async for raw in ws:",
+        # который не даёт способа отличить "соединение реально висит без
+        # единого сообщения" от "просто пока тихо" - в логах была только ОДНА
+        # строка "Подключение к WS..." и потом полная тишина часами, без
+        # единой ошибки/переподключения, при том что реальный тейп сделок
+        # (executed_buy/executed_sell) всегда оставался 0. Теперь читаем
+        # сообщения вручную через recv() с таймаутом - это даёт (1) отдельное
+        # подтверждение, что handshake реально завершился, (2) периодический
+        # heartbeat с фактическим счётчиком сырых сообщений, и (3)
+        # принудительный реконнект, если за 20с не пришло вообще ничего -
+        # такого тайм-аута быть не должно в норме (BTC/ETH aggTrade идут по
+        # несколько раз в секунду), так что его срабатывание само по себе
+        # диагностически значимо.
         backoff = 1
         consecutive_failures = 0
         url = self._url()
@@ -79,8 +92,27 @@ class BinanceTradeFeed:
                     backoff = 1
                     consecutive_failures = 0
                     self._outage_notified = False
-                    async for raw in ws:
+                    log.info("binance_trades: WS-соединение установлено, жду сделки...")
+                    last_heartbeat = time.time()
+                    msgs_since_heartbeat = 0
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=20.0)
+                        except asyncio.TimeoutError:
+                            log.warning("binance_trades: НИ ОДНОГО сырого сообщения от Binance за "
+                                        "последние 20с на установленном соединении - это ненормально "
+                                        "для BTC/ETH aggTrade (обычно несколько сообщений в секунду), "
+                                        "похоже на тихое зависание - принудительно переподключаюсь")
+                            break
+                        msgs_since_heartbeat += 1
                         self._handle_message(raw)
+                        now_ = time.time()
+                        if now_ - last_heartbeat >= 30:
+                            log.info("binance_trades: heartbeat - %d сырых сообщений за последние "
+                                      "~30с, размеры тейпов: %s", msgs_since_heartbeat,
+                                      {sym: len(t) for sym, t in self._tape.items()})
+                            last_heartbeat = now_
+                            msgs_since_heartbeat = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:
