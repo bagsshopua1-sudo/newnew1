@@ -735,6 +735,20 @@ class OrderManager:
         # моменте, а в логах их не было вообще, приходилось гадать по
         # косвенным WALL_CANDIDATE/WALL_OUTCOME). Теперь видно держащая/
         # встречная в USD на каждой смене состояния серии.
+        # НАЙДЕНО В ПРОДЕ 19.08 - прямая причина жалобы пользователя ("встречная
+        # 3кк появилась, а бот держит сделку"): жёсткий сброс streak->0 на ОДНОМ
+        # пропущенном тике убивал серию почти всегда, ДО того как она успевала
+        # дойти до 3. Живой пример из логов (LONG от 11:30:29): в 11:32:12 серия
+        # началась (держащая=0 встречная=1734031), но уже в 11:32:20 сброшена на
+        # 2/3 тиках с "держащая=0 встречная=0" - то есть блокирующая стенка на
+        # ОДНОМ тике просто выпала из snap.ask_walls (мигнула) и весь прогресс
+        # обнулился, хотя её USD реально не менялся ни до, ни после - через пару
+        # секунд она вернулась, но серия уже начиналась с нуля. Дёрганье walls-
+        # списка от тика к тику (а не только dominance_now) - отдельный источник
+        # шума, который жёсткий reset не переживал. Меняем на "протекающее
+        # ведро": пропущенный тик снимает 1 из streak вместо обнуления - серия
+        # True,True,miss,True,True всё ещё доходит до 3 и закрывает сделку,
+        # вместо того чтобы начинать заново с нуля на каждом одиночном сбое.
         if dominance_now:
             if pos.wall_dominance_streak == 0:
                 log.info("[%s] dominance: серия началась (держащая=%.0f встречная=%.0f, нужно %d "
@@ -743,10 +757,11 @@ class OrderManager:
             pos.wall_dominance_streak += 1
         else:
             if pos.wall_dominance_streak > 0:
-                log.info("[%s] dominance: серия сброшена на %d/%d тиках (держащая=%.0f встречная=%.0f)",
-                          pos.symbol, pos.wall_dominance_streak, CFG.wall_dominance_confirm_ticks,
+                pos.wall_dominance_streak -= 1
+                log.info("[%s] dominance: пропущен тик, серия %d/%d -> %d/%d (держащая=%.0f встречная=%.0f)",
+                          pos.symbol, pos.wall_dominance_streak + 1, CFG.wall_dominance_confirm_ticks,
+                          pos.wall_dominance_streak, CFG.wall_dominance_confirm_ticks,
                           holding_usd, blocking_usd_now)
-            pos.wall_dominance_streak = 0
         if pos.wall_dominance_streak >= CFG.wall_dominance_confirm_ticks:
             log.info("[%s] dominance: ПОДТВЕРЖДЕНО %d тиков подряд (держащая=%.0f встречная=%.0f) - "
                       "закрываем", pos.symbol, pos.wall_dominance_streak, holding_usd, blocking_usd_now)
