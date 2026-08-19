@@ -125,6 +125,16 @@ class ManagedPosition:
     # ("стенка просела относительно СВОЕГО же размера на входе"), а не
     # сравнивается с каким-то фиксированным числом на все сделки сразу.
     entry_wall_usd: float = 0.0
+    # Последний РЕАЛЬНО увиденный размер держащей/встречной стенки и когда
+    # именно (snap.ts) - см. CFG.wall_presence_grace_sec и комментарий в
+    # _thesis_invalidated. Сырой снепшот Binance partial-depth (топ-20
+    # уровней) может на одном тике не содержать стенку, которая на бирже
+    # никуда не делась - без этого кэша такой тик читался бы как "стенки
+    # нет" (0 USD) вместо её последнего известного размера.
+    last_blocking_wall_usd: float = 0.0
+    last_blocking_wall_ts: float = 0.0
+    last_holding_wall_usd: float = 0.0
+    last_holding_wall_ts: float = 0.0
 
 
 class OrderManager:
@@ -712,17 +722,40 @@ class OrderManager:
         # (3 тика) ниже - см. pos.wall_dominance_streak.
         blocking_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
         holding_walls = snap.bid_walls if pos.side == "long" else snap.ask_walls
-        dominance_now = False
-        blocking_usd_now = 0.0
-        holding_usd = 0.0
+        now_ts = snap.ts
+
+        # НАЙДЕНО В ПРОДЕ 19.08 - см. CFG.wall_presence_grace_sec: snap.ask_walls/
+        # bid_walls - это сырой топ-20 снепшот Binance partial-depth стрима, а не
+        # персистентный трекинг. Реальная стенка может на одном тике просто не
+        # попасть в эти 20 уровней (плотный стакан), хотя на бирже она никуда не
+        # делась - раньше это читалось как "стенки нет" (0 USD) и dominance_now
+        # даже не успевал попробовать стать True (живой пример - SHORT 64463.70,
+        # ноль строк "dominance:" за всю сделку). Держим последний реально
+        # увиденный размер ещё wall_presence_grace_sec секунд, прежде чем
+        # признать стенку по-настоящему исчезнувшей.
         if blocking_walls:
             nearest_blocking = min(blocking_walls, key=lambda w: w.distance_pct)
-            nearest_holding = min(holding_walls, key=lambda w: w.distance_pct) if holding_walls else None
-            holding_usd = nearest_holding.usd if nearest_holding else 0.0
             blocking_usd_now = nearest_blocking.usd
-            opposing_is_real_wall = nearest_blocking.usd >= CFG.wall_min_usd
-            opposing_at_least_holding = nearest_blocking.usd >= holding_usd
-            dominance_now = opposing_is_real_wall and opposing_at_least_holding
+            pos.last_blocking_wall_usd = blocking_usd_now
+            pos.last_blocking_wall_ts = now_ts
+        elif now_ts - pos.last_blocking_wall_ts <= CFG.wall_presence_grace_sec:
+            blocking_usd_now = pos.last_blocking_wall_usd
+        else:
+            blocking_usd_now = 0.0
+
+        if holding_walls:
+            nearest_holding = min(holding_walls, key=lambda w: w.distance_pct)
+            holding_usd = nearest_holding.usd
+            pos.last_holding_wall_usd = holding_usd
+            pos.last_holding_wall_ts = now_ts
+        elif now_ts - pos.last_holding_wall_ts <= CFG.wall_presence_grace_sec:
+            holding_usd = pos.last_holding_wall_usd
+        else:
+            holding_usd = 0.0
+
+        opposing_is_real_wall = blocking_usd_now >= CFG.wall_min_usd
+        opposing_at_least_holding = blocking_usd_now >= holding_usd
+        dominance_now = opposing_is_real_wall and opposing_at_least_holding
         # Отдельный, собственный счётчик подряд идущих тиков для ЭТОЙ проверки
         # (не общий invalidation_streak) - см. комментарий у
         # pos.wall_dominance_streak. Разовое дёрганье стенки на 1 тик больше
