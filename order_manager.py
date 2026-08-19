@@ -226,49 +226,67 @@ class OrderManager:
                 if existing.side == signal.side:
                     log.debug("[%s] уже есть открытая позиция в ту же сторону, сигнал пропущен", signal.symbol)
                     return
-                # Свежий сигнал ПРОТИВ открытой позиции (новая стенка/пробой с
-                # противоположной стороны) - это не шум, а реальный сдвиг структуры
-                # рынка. Раньше такой сигнал молча отбрасывался (has_position() ->
-                # return), и позиция ждала своих штатных условий выхода (стоп/тейк/
-                # thesis_invalidated с INVALIDATION_CONFIRM_TICKS подтверждениями) -
-                # жалоба пользователя: "после лонга надо сразу шортить, а оно стоит,
-                # потом цена падает и закрывает в минус". Закрываем НЕМЕДЛЕННО по
-                # рынку, без debounce (как и _opposing_wall_exit) - раз структура
-                # уже развернулась, ждать нет смысла, только отдаём движение.
-                # Кулдаун на ПОВТОРНЫЙ разворот - см. CFG.reversal_cooldown_sec и
-                # комментарий у self._last_reversal_ts в __init__. Первый разворот
-                # всегда мгновенный (как и раньше) - ограничиваем только частоту
-                # повторных, чтобы не флипаться туда-сюда в боковике.
-                last_reversal = self._last_reversal_ts.get(signal.symbol)
-                if last_reversal is not None:
-                    since_reversal = time.time() - last_reversal
-                    if since_reversal < CFG.reversal_cooldown_sec:
-                        log.info("[%s] разворот пропущен: кулдаун после предыдущего разворота "
-                                  "(%.0fs назад из %.0fs) - позиция %s остаётся как есть",
-                                  signal.symbol, since_reversal, CFG.reversal_cooldown_sec,
-                                  existing.side.upper())
-                        return
+                # ОТКЛЮЧЕНО 19.08 по прямой просьбе пользователя ("reversal_signal
+                # тоже убирай") - после включения wall-flip dominance логики
+                # (19.08, см. _thesis_invalidated) и живых наблюдений выяснилось,
+                # что мгновенный разворот по СВЕЖЕМУ встречному сигналу тоже даёт
+                # плохие закрытия - отдельный от dominance путь, не завязанный на
+                # реальную структуру СВОЕЙ стенки, а просто на факт нового сигнала.
+                # Раньше (до 18.08, см. история ниже) такой сигнал молча
+                # отбрасывался - возвращаемся к этому: позицию теперь закрывает
+                # ТОЛЬКО штатный "умный" выход (wall-flip dominance / стоп / тейк /
+                # time_exit) в _watch_position, реагирующий на РЕАЛЬНЫЙ разворот
+                # доминирования у своей же стенки, а не на любой новый сигнал.
+                # Если понадобится вернуть - меняем `if False:` ниже на `if True:`.
+                if False:
+                    # Свежий сигнал ПРОТИВ открытой позиции (новая стенка/пробой с
+                    # противоположной стороны) - это не шум, а реальный сдвиг структуры
+                    # рынка. Раньше такой сигнал молча отбрасывался (has_position() ->
+                    # return), и позиция ждала своих штатных условий выхода (стоп/тейк/
+                    # thesis_invalidated с INVALIDATION_CONFIRM_TICKS подтверждениями) -
+                    # жалоба пользователя: "после лонга надо сразу шортить, а оно стоит,
+                    # потом цена падает и закрывает в минус". Закрываем НЕМЕДЛЕННО по
+                    # рынку, без debounce (как и _opposing_wall_exit) - раз структура
+                    # уже развернулась, ждать нет смысла, только отдаём движение.
+                    # Кулдаун на ПОВТОРНЫЙ разворот - см. CFG.reversal_cooldown_sec и
+                    # комментарий у self._last_reversal_ts в __init__. Первый разворот
+                    # всегда мгновенный (как и раньше) - ограничиваем только частоту
+                    # повторных, чтобы не флипаться туда-сюда в боковике.
+                    last_reversal = self._last_reversal_ts.get(signal.symbol)
+                    if last_reversal is not None:
+                        since_reversal = time.time() - last_reversal
+                        if since_reversal < CFG.reversal_cooldown_sec:
+                            log.info("[%s] разворот пропущен: кулдаун после предыдущего разворота "
+                                      "(%.0fs назад из %.0fs) - позиция %s остаётся как есть",
+                                      signal.symbol, since_reversal, CFG.reversal_cooldown_sec,
+                                      existing.side.upper())
+                            return
 
-                log.info("[%s] РАЗВОРОТ: сигнал %s (%s) против открытой позиции %s - закрываем немедленно",
-                          signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
-                self._last_reversal_ts[signal.symbol] = time.time()
-                snap = self._latest_snap.get(signal.symbol)
-                existing.pending_close_reason = "reversal_signal"
-                await self._close_position_safely(existing, snap, "reversal_signal")
-                if self.has_position(signal.symbol):
-                    # Закрытие исполнилось не полностью (paper: не пересекло спред) -
-                    # остаток всё ещё числится открытым, новую позицию поверх не
-                    # открываем. pending_close_reason выставлен выше - следующий тик
-                    # _watch_position реально дозакроет хвост той же причиной, а не
-                    # будет заново ждать штатных условий выхода (см. комментарий у
-                    # ManagedPosition.pending_close_reason).
+                    log.info("[%s] РАЗВОРОТ: сигнал %s (%s) против открытой позиции %s - закрываем немедленно",
+                              signal.symbol, signal.side.upper(), signal.signal_type, existing.side.upper())
+                    self._last_reversal_ts[signal.symbol] = time.time()
+                    snap = self._latest_snap.get(signal.symbol)
+                    existing.pending_close_reason = "reversal_signal"
+                    await self._close_position_safely(existing, snap, "reversal_signal")
+                    if self.has_position(signal.symbol):
+                        # Закрытие исполнилось не полностью (paper: не пересекло спред) -
+                        # остаток всё ещё числится открытым, новую позицию поверх не
+                        # открываем. pending_close_reason выставлен выше - следующий тик
+                        # _watch_position реально дозакроет хвост той же причиной, а не
+                        # будет заново ждать штатных условий выхода (см. комментарий у
+                        # ManagedPosition.pending_close_reason).
+                        return
+                    watcher = self._watchers.pop(signal.symbol, None)
+                    if watcher:
+                        watcher.cancel()
+                    # Ниже продолжаем этим же вызовом на вход в новую (развернутую)
+                    # сторону - не ждём следующего независимого срабатывания сигнала,
+                    # это и есть "сразу шортить", а не через один-два цикла проверки.
+                else:
+                    log.debug("[%s] встречный сигнал против открытой позиции %s проигнорирован "
+                              "(reversal_signal отключён 19.08) - позицию закрывает только "
+                              "штатный умный выход", signal.symbol, existing.side.upper())
                     return
-                watcher = self._watchers.pop(signal.symbol, None)
-                if watcher:
-                    watcher.cancel()
-                # Ниже продолжаем этим же вызовом на вход в новую (развернутую)
-                # сторону - не ждём следующего независимого срабатывания сигнала,
-                # это и есть "сразу шортить", а не через один-два цикла проверки.
             else:
                 # Кулдаун ТОЛЬКО для входа с нуля (existing был None) - см.
                 # CFG.reentry_cooldown_sec. Разворот выше (existing is not None)
@@ -654,31 +672,39 @@ class OrderManager:
         # (0) - это ещё хуже, чем слабая: любая блокирующая стенка тогда
         # считается доминирующей.
         #
-        # ПЕРЕПИСАНО 18.08 вечером по прямой просьбе пользователя - раньше
-        # тут был голый ratio=1.0 (любой перевес блокирующей стенки над
-        # держащей, хоть на цент, считался разворотом) - и это оказалась
-        # самая шумная из всех проверок, дёргающая structure_invalidated на
-        # каждую мелкую флуктуацию. Новая логика - конкретный пример от
-        # пользователя: "если он лонгует и заявка с 1.5кк [размер стенки НА
-        # ВХОДЕ] стала 400к, а верхняя в шорт стала 1.5кк - то надо
-        # выходить". Т.е. это не "чуть перевесило", а решительный разворот:
-        # (а) стенка, от которой вошли, ЗАМЕТНО просела относительно своего
-        # же размера на входе (см. pos.entry_wall_usd), И (б) встречная
-        # стенка успела дорасти до того же калибра, что и вход (тот же
-        # порог, что даёт сигнал на вход - CFG.binance_wall_min_usd/
-        # wall_min_usd) - обе стенки должны стать "зеркальными" по факту, а
-        # не просто одна на волосок больше другой.
+        # ПЕРЕПИСАНО 18.08 вечером, затем ЕЩЁ РАЗ 19.08 по прямой просьбе
+        # пользователя после разбора живых сделок. Версия от 18.08 требовала
+        # ДВУХ условий: держащая стенка просела ≤30% от своего размера НА
+        # ВХОДЕ (WALL_FLIP_SHRINK_RATIO), И встречная стенка доросла до
+        # калибра входного порога (BINANCE_WALL_MIN_USD=1.5М). На практике
+        # (см. живые примеры пользователя 19.08) это оказалось СЛИШКОМ
+        # ПОЗДНО: сделка на 64358.80 - держащая стенка 2М просела всего до
+        # 1М (50%, не ≤30%) ровно когда встречная стенка тоже стала 1М -
+        # то есть стенки УЖЕ СРАВНЯЛИСЬ, а бот всё ещё держал позицию, потому
+        # что ни одно из двух условий формально не выполнилось (1М/2М=50%>30%,
+        # и 1М < 1.5М порога). Второй пример - держащая 2М просела до 1М,
+        # встречная была уже 2.5М (больше самого входного порога) с самого
+        # начала - бот всё равно держал, по той же причине (50%>30%).
+        # Пользователь прямо потребовал: сравнивать ТЕКУЩИЕ размеры стенок
+        # напрямую (кто сейчас больше - та стенка и держит), а не % от
+        # исторического размера на входе. pos.entry_wall_usd больше не
+        # участвует в сравнении (оставлено в ManagedPosition как история/на
+        # случай отката). "Встречная - настоящая" теперь проверяется по
+        # низкому базовому порогу WALL_MIN_USD (150к), а не по калибру
+        # входного сигнала (1.5М) - иначе ровно так же пропускаем случаи,
+        # где встречная всего 1М, но этого уже достаточно, раз она сравнялась
+        # с держащей. Шум на 1 тик всё ещё гасится WALL_DOMINANCE_CONFIRM_TICKS
+        # (3 тика) ниже - см. pos.wall_dominance_streak.
         blocking_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
         holding_walls = snap.bid_walls if pos.side == "long" else snap.ask_walls
         dominance_now = False
-        if blocking_walls and pos.entry_wall_usd > 0:
+        if blocking_walls:
             nearest_blocking = min(blocking_walls, key=lambda w: w.distance_pct)
             nearest_holding = min(holding_walls, key=lambda w: w.distance_pct) if holding_walls else None
             holding_usd = nearest_holding.usd if nearest_holding else 0.0
-            entry_wall_shrunk = holding_usd <= pos.entry_wall_usd * CFG.wall_flip_shrink_ratio
-            opposing_grade_threshold = CFG.binance_wall_min_usd if CFG.use_binance_signals else CFG.wall_min_usd
-            opposing_grew_to_real_wall = nearest_blocking.usd >= opposing_grade_threshold
-            dominance_now = entry_wall_shrunk and opposing_grew_to_real_wall
+            opposing_is_real_wall = nearest_blocking.usd >= CFG.wall_min_usd
+            opposing_at_least_holding = nearest_blocking.usd >= holding_usd
+            dominance_now = opposing_is_real_wall and opposing_at_least_holding
         # Отдельный, собственный счётчик подряд идущих тиков для ЭТОЙ проверки
         # (не общий invalidation_streak) - см. комментарий у
         # pos.wall_dominance_streak. Разовое дёрганье стенки на 1 тик больше
