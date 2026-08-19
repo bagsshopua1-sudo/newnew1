@@ -119,7 +119,12 @@ class ManagedPosition:
     # structure_invalidated за 13-90 сек) - значит основной шум шёл через
     # эти две ветки, которые до этого закрывали мгновенно, за 1 тик.
     wall_eaten_streak: int = 0
-    imbalance_streak: int = 0
+    # Счётчик подряд идущих тиков, где _opposite_flow_exit увидел решительно
+    # доминирующий встречный исполненный поток (19.08, финальный этап
+    # рестройки) - тот же debounce-принцип, что и у wall_dominance_streak/
+    # wall_eaten_streak выше, но со своим порогом (opposite_flow_confirm_ticks),
+    # заменяет удалённую imbalance_streak-проверку (см. _thesis_invalidated).
+    opposite_flow_streak: int = 0
     # Размер стенки, от которой реально вошли в сделку (Signal.wall_usd на
     # момент входа) - используется в новой версии dominance-проверки выше
     # ("стенка просела относительно СВОЕГО же размера на входе"), а не
@@ -139,12 +144,18 @@ class ManagedPosition:
 
 class OrderManager:
     def __init__(self, exchange: ExchangeClient, market_data: MarketData, risk: RiskManager,
-                 trade_log: Optional[TradeLog] = None, kill_switch=None):
+                 trade_log: Optional[TradeLog] = None, kill_switch=None, trade_feed=None):
         self.exchange = exchange
         self.md = market_data
         self.risk = risk
         self.trade_log = trade_log
         self.kill_switch = kill_switch
+        # BinanceTradeFeed - реальный исполненный тейп (см. binance_trades.py),
+        # передаётся из bot.py. Используется в _opposite_flow_exit (19.08,
+        # финальный этап рестройки) - в отличие от signals.py, где тейп решает
+        # ВХОДИТЬ ли, тут он решает, не развернулся ли реальный поток ПРОТИВ
+        # уже открытой позиции. None, если Binance-сигналы выключены.
+        self.trade_feed = trade_feed
         self.positions: Dict[str, ManagedPosition] = {}  # symbol -> position
         self._watchers: Dict[str, asyncio.Task] = {}
         self._latest_snap: Dict[str, "BookSnapshot"] = {}  # стакан Lighter - цена исполнения
@@ -316,7 +327,8 @@ class OrderManager:
 
             plan = self.risk.build_plan(signal.symbol, signal.side, signal.mid,
                                          wall_price=signal.reference_price,
-                                         wall_usd=signal.wall_usd, backup_usd=signal.backup_usd)
+                                         wall_usd=signal.wall_usd, backup_usd=signal.backup_usd,
+                                         exchange_basis=signal.exchange_basis)
             if plan.size <= 0 or plan.size < market.min_base_amount:
                 log.warning("[%s] расчётный размер позиции %.6f меньше минимального лота, сигнал пропущен",
                             signal.symbol, plan.size)
@@ -573,6 +585,33 @@ class OrderManager:
                     pos.invalidation_streak = 0
                     continue
 
+                # OPPOSITE-FLOW EXIT (19.08, финальный этап рестройки стратегии) -
+                # новый тип "умного" выхода из явного списка требований
+                # пользователя ("opposite-flow exit"), отдельный и от
+                # THESIS INVALIDATED (структура своей стенки сломалась), и от
+                # THESIS WEAKENING (цена откатила от MFE). Смотрит на РЕАЛЬНЫЙ
+                # исполненный поток (BinanceTradeFeed) рядом с ТЕКУЩЕЙ ценой,
+                # а не у стенки входа - если агрессивный объём в последних
+                # секундах явно течёт ПРОТИВ позиции, это опережающий признак
+                # того, что edge, на котором строился вход (order flow), уже
+                # исчез, даже если формальная структура ещё не успела
+                # развалиться. Ждём thesis_grace_period_sec (тот же грейс, что
+                # и у _thesis_invalidated) - сразу после входа обычный шум
+                # тейпа не должен закрывать свежую позицию.
+                if time.time() - pos.opened_at >= CFG.thesis_grace_period_sec and \
+                        self._opposite_flow_exit(pos, snap):
+                    pos.opposite_flow_streak += 1
+                else:
+                    pos.opposite_flow_streak = 0
+                if pos.opposite_flow_streak >= CFG.opposite_flow_confirm_ticks:
+                    pos.pending_close_reason = "opposite_flow"
+                    await self._close_position_safely(pos, snap, "opposite_flow")
+                    if not self.has_position(pos.symbol):
+                        return
+                    pos.opposite_flow_streak = 0
+                    pos.invalidation_streak = 0
+                    continue
+
                 # TIME_EXIT (этап 2.3, уточнено в этапе 5 аудита 18.08). Если
                 # сделка висит дольше эффективного лимита и так и не сдвинулась
                 # в нашу пользу дальше TIME_EXIT_MIN_PROFIT_PCT - тезис явно не
@@ -641,9 +680,25 @@ class OrderManager:
                 # затухает. Не завязано на invalidation_streak - решение
                 # принимается сразу, но частичный выход срабатывает не больше
                 # одного раза за сделку (weakening_partial_done).
+                # ИСПРАВЛЕНО 19.08 (финальный этап рестройки) - НАЙДЕН РЕАЛЬНЫЙ БАГ:
+                # условие `profit_pct > 0` не даёт этой ветке сработать вообще,
+                # если цена успела ПОЛНОСТЬЮ откатить от MFE через вход и уйти в
+                # минус - то есть ровно в том случае, который эта проверка и
+                # должна ловить (momentum decay), она молчала. Живая жалоба
+                # пользователя: шорт по 69655, цена дошла до 69560 (в плюсе),
+                # затем развернулась до 69685 (уже в минусе) - позиция
+                # оставалась открытой, потому что profit_pct к этому моменту
+                # был отрицательным и WEAKENING не проверялся вовсе, хотя MFE
+                # уже был набран, а retrace от него - почти полный. Убрали
+                # гейт `profit_pct > 0` - retrace_pct = mfe_pct - profit_pct
+                # корректно считается и тогда, когда profit_pct отрицателен
+                # (в этом случае retrace получается даже БОЛЬШЕ mfe_pct, и
+                # условие retrace_pct >= mfe_pct * MOMENTUM_DECAY_RETRACE_PCT
+                # сразу истинно) - именно так и должно быть: чем сильнее
+                # откат от пика (вплоть до ухода в минус), тем очевиднее, что
+                # импульс, на котором строился вход, уже не работает.
                 if (not thesis_invalid and not pos.weakening_partial_done
-                        and pos.mfe_pct > CFG.wall_eaten_flat_pct * CFG.weakening_mfe_min_mult
-                        and profit_pct > 0):
+                        and pos.mfe_pct > CFG.wall_eaten_flat_pct * CFG.weakening_mfe_min_mult):
                     retrace_pct = pos.mfe_pct - profit_pct
                     if retrace_pct >= pos.mfe_pct * CFG.momentum_decay_retrace_pct:
                         close_amount = pos.filled_size * CFG.weakening_partial_close_pct
@@ -864,23 +919,20 @@ class OrderManager:
                     return True
             else:
                 pos.wall_eaten_streak = 0
-            # дисбаланс резко развернулся против позиции - давление сменилось.
-            # ОТКЛЮЧЕНО 18.08 поздно вечером - та же причина, что и у
-            # wall_eaten_flat выше: пользователь прямо просил держать позицию
-            # ИСКЛЮЧИТЕЛЬНО до разворота доминирования стенок (dominance
-            # выше), без дополнительных "умных" причин. imbalance - метрика
-            # ПО ВСЕЙ книге, а не по конкретной стенке входа - могла закрыть
-            # сделку, даже когда стенка, от которой вошли, ещё на месте и
-            # никуда не делась. Если понадобится вернуть - меняем False на
-            # исходное условие ниже.
-            imb = snap.imbalance if pos.side == "long" else (1 - snap.imbalance)
-            imbalance_flip_now = False and (imb < (1 - CFG.imbalance_threshold))
-            if imbalance_flip_now:
-                pos.imbalance_streak += 1
-            else:
-                pos.imbalance_streak = 0
-            if pos.imbalance_streak >= CFG.wall_dominance_confirm_ticks:
-                return True
+            # Старая проверка "дисбаланс по всей книге развернулся" (imbalance_flip_now)
+            # УДАЛЕНА 19.08 (финальный этап рестройки) - она была отключена
+            # 18.08 по прямой просьбе пользователя именно потому, что imbalance -
+            # метрика ПО ВСЕЙ книге, не привязанная к конкретной стенке входа, и
+            # могла закрыть сделку даже когда своя стенка ещё на месте. Заменена
+            # по существу более точным механизмом - см. _opposite_flow_exit
+            # ниже: вместо статичного снимка дисбаланса объёма в стакане
+            # смотрим на РЕАЛЬНЫЙ исполненный поток (BinanceTradeFeed) рядом с
+            # текущей ценой за последние секунды - то же самое намерение
+            # ("поток развернулся против нас"), но по факту исполненных сделок,
+            # а не по displayed-размеру заявок, и со своим debounce
+            # (opposite_flow_confirm_ticks), а не завязана на общий
+            # wall_dominance_confirm_ticks. Проверяется отдельно в
+            # _watch_position, не здесь.
             return False
 
         if pos.signal_type == "breakout":
@@ -964,6 +1016,63 @@ class OrderManager:
             else ((pos.avg_entry - exec_snap.mid) / pos.avg_entry * 100)
         return profit_pct >= effective_min_profit_pct
 
+    def _opposite_flow_exit(self, pos: ManagedPosition, snap) -> bool:
+        """
+        Opposite-flow exit (19.08, финальный этап рестройки) - см. вызов и
+        обоснование в _watch_position. В отличие от _thesis_invalidated
+        (смотрит на структуру - размеры стенок у уровня входа) и
+        _opposing_wall_exit (смотрит на появление НОВОЙ встречной стенки),
+        здесь смотрим на РЕАЛЬНЫЙ исполненный поток (не displayed-размер
+        заявок) рядом с текущей ценой - та же функция executed_usd_trend, что
+        используется для классификации входа в signals.py, применённая уже
+        ПОСЛЕ входа для проверки "не развернулся ли сам order flow".
+
+        snap - стакан Lighter (цена исполнения) - тейп же общий по символу у
+        BinanceTradeFeed, конкретная биржа-источник тут не выбирается, только
+        текущая цена, вокруг которой смотрим окно.
+        """
+        if self.trade_feed is None or snap is None:
+            return False
+        try:
+            buckets = self.trade_feed.executed_usd_trend(
+                pos.symbol, snap.mid, CFG.opposite_flow_range_pct,
+                lookback_sec=CFG.opposite_flow_lookback_sec, buckets=4)
+        except Exception:
+            return False
+        total_buy = sum(b["buy_usd"] for b in buckets)
+        total_sell = sum(b["sell_usd"] for b in buckets)
+        if total_buy + total_sell < CFG.opposite_flow_min_total_usd:
+            return False  # слишком разреженный поток, чтобы вообще судить о направлении
+
+        supportive = total_buy if pos.side == "long" else total_sell
+        opposing = total_sell if pos.side == "long" else total_buy
+        if supportive <= 0:
+            return opposing > 0
+        return opposing >= supportive * CFG.opposite_flow_dominance_ratio
+
+    def _effective_trailing_pct(self, pos: ManagedPosition) -> float:
+        """
+        Dynamic profit taking (19.08, финальный этап рестройки, прямой пункт
+        запроса пользователя - "не жди только фиксированный TP/SL") - трейлинг
+        подтягивается ТЕМ ПЛОТНЕЕ к пику, чем дальше сделка уже прошла в нашу
+        пользу относительно исходного риска (стоп-дистанции). Отдавать один и
+        тот же фиксированный % от пика разумно, пока путь небольшой - но чем
+        больше уже набрано MFE относительно риска на сделку, тем больше в
+        абсолютном выражении означает отдать ту же долю обратно. Ступенчато
+        (не непрерывная функция) - проще объяснить и предсказать, чем плавная
+        формула, при сопоставимом эффекте.
+        """
+        base = pos.plan.trailing_stop_pct
+        stop_distance_pct = abs(pos.plan.entry_price - pos.plan.stop_price) / pos.plan.entry_price * 100
+        if stop_distance_pct <= 0 or pos.mfe_pct <= 0:
+            return base
+        mfe_multiple = pos.mfe_pct / stop_distance_pct
+        if mfe_multiple >= CFG.dynamic_trailing_mfe_mult_2:
+            return base * CFG.dynamic_trailing_tighten_pct_2
+        if mfe_multiple >= CFG.dynamic_trailing_mfe_mult_1:
+            return base * CFG.dynamic_trailing_tighten_pct_1
+        return base
+
     async def _update_trailing_stop(self, pos: ManagedPosition, price: float):
         improved = False
         if pos.side == "long" and price > pos.trailing_extreme:
@@ -976,7 +1085,11 @@ class OrderManager:
         if not improved:
             return
 
-        trail_dist = pos.trailing_extreme * pos.plan.trailing_stop_pct / 100
+        # Dynamic profit taking - см. _effective_trailing_pct: подтягиваем
+        # трейлинг плотнее по мере роста MFE относительно исходного риска,
+        # вместо одного и того же фиксированного % пути всегда.
+        trailing_pct = self._effective_trailing_pct(pos)
+        trail_dist = pos.trailing_extreme * trailing_pct / 100
         new_sl = (pos.trailing_extreme - trail_dist) if pos.side == "long" else (pos.trailing_extreme + trail_dist)
 
         better = (new_sl > pos.current_sl_price) if pos.side == "long" else (new_sl < pos.current_sl_price)
@@ -1134,9 +1247,11 @@ class OrderManager:
             self.trade_log.close_trade(pos.trade_id, exit_price, pos.realized_pnl, reason,
                                         mfe_pct=pos.mfe_pct, mae_pct=pos.mae_pct)
         self.positions.pop(pos.symbol, None)
-        if reason in ("stop_loss", "opposing_wall", "structure_invalidated", "time_exit"):
+        if reason in ("stop_loss", "opposing_wall", "structure_invalidated", "time_exit", "opposite_flow"):
             # НЕ трогаем при reversal_signal - см. CFG.reentry_cooldown_sec/
-            # комментарий у self._last_close_ts в __init__.
+            # комментарий у self._last_close_ts в __init__. opposite_flow
+            # добавлен 19.08 (финальный этап рестройки) - тот же принцип: не
+            # влезать сразу обратно, пока не пройдёт кулдаун после закрытия.
             self._last_close_ts[pos.symbol] = time.time()
         log.info("[%s] позиция закрыта (%s): последний кусок %.6f по %.2f | PnL сделки суммарно=%.2f",
                   pos.symbol, reason, current_size, exit_price, pos.realized_pnl)
