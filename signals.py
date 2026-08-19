@@ -2,33 +2,68 @@
 Сигнальный движок: превращает поток снапшотов стакана (market_data.BookSnapshot)
 в торговые сигналы long/short.
 
-Два паттерна:
-  - ABSORPTION (поглощение): цена подходит к крупной стенке, стенка держится
-    (не тает и не убегает) несколько снапшотов подряд, цена стопорится рядом ->
-    сигнал в сторону ОТ стенки (фейд).
-  - BREAKOUT (пробой): стенка, которая долго стояла, резко исчезает
-    (съедена агрессивным потоком, а не просто отодвинулась) -> сигнал ПО тренду.
+=== Архитектура (рестройка 19.08, финальный этап) ===
+Раньше решение "входить или нет" принималось почти сразу по факту события в
+стакане: стенка появилась/держится N тиков -> ABSORPTION; стенка исчезла и
+цена её прошла -> BREAKOUT. Проблема (прямая формулировка пользователя): бот
+реагирует на наличие крупной лимитки, но недостаточно хорошо понимает, что
+реально происходит вокруг неё - решение было почти целиком завязано на факт
+существования стенки и её displayed-размер.
 
-Фильтр спуфинга: если стенка исчезла, а цена к ней даже не приближалась
-(дистанция почти не менялась) — это, скорее всего, снятая "фейковая" заявка,
-такой уход стенки сигналом не считается. Плюс отдельная история отмен по зоне
-цены (см. _record_cancel/_zone_cancel_count) - если в одной и той же зоне
-заявки регулярно снимаются именно при подходе цены, это подозрительная зона.
+Теперь решение перестроено вокруг события:
+    NEW / CHANGED LIQUIDITY -> MARKET REACTION -> DECISION
 
-Помимо самого факта "стенка есть/нет", размер стенки сам по себе - слабый
-сигнал (см. обсуждение с пользователем и рекомендации по итогам разбора).
-Поэтому дополнительно считаем:
-  - replenishment: восстанавливается ли displayed size после проседания
-    (recurring refill) - признак настоящего интереса/iceberg, а не разовой заявки;
-  - executed-объём рядом со стенкой по реальным сделкам (BinanceTradeFeed) -
-    сколько на самом деле прошло объёма, а не только что видно в стакане;
-  - "зона", а не точная цена - маркет-мейкер может подвинуть заявку на пару
-    центов, это не значит что стенка пропала (см. _find_shifted_match);
-  - составной WALL_SCORE из этих компонент - логируется для каждого кандидата
-    (прошёл фильтры или нет), НЕ используется пока как жёсткий гейт (см.
-    коммент у CFG.wall_backup_min_ratio - подкручивание порогов вслепую уже
-    один раз положило вход в сделки на 0, лучше сначала накопить данные по
-    логам WALL_CANDIDATE/WALL_OUTCOME и откалибровать осмысленно).
+Каждое значимое изменение стенки (появилась/долго держится/исчезла)
+классифицируется РОВНО в одно из пяти состояний (см. _classify_persistence/
+_classify_disappearance ниже):
+    REAL_WALL  - заявка есть и защищает уровень, но недостаточно динамики
+                 вокруг неё, чтобы на этом строить сделку.
+    ABSORPTION - в стенку реально идёт агрессивный исполненный объём
+                 (BinanceTradeFeed, не просто displayed size), стенка держится
+                 и восполняется, а давление начинает ослабевать -> FADE.
+    BREAKOUT   - стенка реально съедена исполненным объёмом (не просто
+                 пропала из выдачи), цена прошла её уровень, и поток
+                 продолжает идти в сторону движения -> вход ПО тренду.
+    SPOOF      - стенка исчезла без достаточного реального исполнения -
+                 похоже на снятую фейковую заявку, не сигнал.
+    NO_EDGE    - ничего из вышеперечисленного не подтвердилось увереннно -
+                 сделка НЕ открывается. Это ОСНОВНОЕ, ожидаемое состояние -
+                 стратегия сознательно не пытается поднять winrate числом
+                 фильтров, а ищет редкие моменты, где order flow реально даёт
+                 edge (см. докстринги классификаторов).
+
+Входит бот только по ABSORPTION (-> FADE) и BREAKOUT (-> CONTINUATION);
+REAL_WALL/SPOOF/NO_EDGE логируются (см. _log_wall_event) для аудита, но не
+порождают Signal - как и было задокументировано в этапах 3/4 аудита
+(_absorption_shadow_eval/_breakout_shadow_eval, теперь переименованные в
+_classify_persistence/_classify_disappearance): те критерии раньше только
+считались и логировались как WOULD_ENTER, реального решения не меняли -
+теперь это и есть реальный гейт (см. CFG.absorption_enabled=True и коммент
+там же).
+
+Ключевой принцип: НЕ размер стенки как главный сигнал, а динамика вокруг неё:
+  - persistence (age/update_count/stall_count - сколько стенка реально стоит);
+  - executed volume (BinanceTradeFeed.executed_usd_near - сколько реально
+    прошло объёма через/у стенки, а не что видно в стакане);
+  - refill (replenishment displayed size после просадки - признак реального
+    интереса/iceberg, а не разовой заявки);
+  - cancellation (_zone_cancel_count - история отмен в этой ценовой зоне);
+  - aggressive flow trend (executed_usd_trend - нарастает или ослабевает
+    поток В стенку, по бакетам времени, не одно число);
+  - price reaction (price_crossed - прошла ли цена уровень фактически);
+  - microprice (_microprice_bias/_microprice_weakening - независимое от
+    тейпа подтверждение из самой книги: смещение "справедливой" цены
+    относительно mid как опережающий индикатор давления);
+  - nearby liquidity (backup_usd - подложка за стенкой, участвует в
+    WALL_SCORE и confidence, но НЕ как жёсткий гейт - см. коммент у
+    CFG.wall_backup_min_ratio, жёсткий порог здесь уже один раз резал
+    100% сигналов);
+  - Binance/Lighter price difference и латентность - учитываются НИЖЕ по
+    потоку, в bot.py (signal_age_ms -> отмена входа, exchange_basis -> risk.py),
+    не здесь: на этом уровне движок видит только книгу источника сигнала.
+
+"Зона", а не точная цена - маркет-мейкер может подвинуть заявку на пару
+центов, это не значит что стенка пропала (см. _find_shifted_match).
 """
 import asyncio
 import itertools
@@ -63,6 +98,14 @@ CANDIDATE_LOG_COOLDOWN_SEC = 5.0  # не спамить лог по одной �
 # логам Render - теперь есть и явная сводка, и (через wall_event_log.py)
 # запрашиваемая по type колонке история.
 FREQUENCY_LOG_INTERVAL_SEC = 300.0
+
+# Пять состояний классификации события ликвидности - см. докстринг модуля.
+# Только ABSORPTION/BREAKOUT порождают реальный Signal.
+STATE_REAL_WALL = "REAL_WALL"
+STATE_ABSORPTION = "ABSORPTION"
+STATE_BREAKOUT = "BREAKOUT"
+STATE_SPOOF = "SPOOF"
+STATE_NO_EDGE = "NO_EDGE"
 
 # Ширина "зоны" для истории отмен - в % от цены (не абсолютное число, чтобы
 # одинаково работало и для BTC (~64000), и для ETH (~3000)).
@@ -103,6 +146,22 @@ class Signal:
     # Теперь дистанция масштабируется реальной глубиной за стенкой.
     wall_usd: float = 0.0
     backup_usd: float = 0.0
+    # Базис между биржей сигнала (Binance) и биржей исполнения (Lighter) на
+    # момент сигнала: lighter_mid - binance_mid (знак важен). Проставляется в
+    # bot.py._maybe_signal сразу после basis-проверки, тем же числом, что уже
+    # используется для basis_pct. Нужен ТОЛЬКО для risk.build_plan - чтобы
+    # скорректировать reference_price (цену стенки, снятую с Binance) на этот
+    # базис перед расчётом дистанции стопа от РЕАЛЬНОЙ цены входа (Lighter).
+    # Без этого raw_distance = |entry(Lighter) - wall(Binance)| включает в себя
+    # межбиржевой разброс цен как будто это расстояние до уровня в стакане -
+    # см. обсуждение с пользователем 19.08 (пример: стенка 68000 на Binance,
+    # исполнение по 68300 на Lighter из-за базиса в 300$, "стоп" 300$ на самом
+    # деле не про структуру рынка вообще). reference_price САМ не трогаем -
+    # он всё ещё используется в Binance-пространстве для пост-входных проверок
+    # тезиса (order_manager: price_broke_through, wall_max_distance и т.п.,
+    # сравниваются с note_signal_snapshot - тоже Binance), там этот сдвиг был
+    # бы уже не нужен и даже вреден.
+    exchange_basis: float = 0.0
 
 
 @dataclass
@@ -271,34 +330,23 @@ class SignalEngine:
                     self.tracked[new_key] = tw
                     continue
 
-                # стенка реально пропала: проверяем спуфинг vs реальное поглощение/пробой
+                # стенка реально пропала: классифицируем BREAKOUT / SPOOF / NO_EDGE
+                # по реальной динамике, а не только по факту "пропала + цена прошла"
+                # (см. _classify_disappearance и докстринг модуля).
                 age = tw.last_seen - tw.first_seen
                 was_close = tw.wall.distance_pct < CFG.wall_max_distance_pct
                 price_crossed = (
                     (tw.wall.side == "ask" and snap.mid >= tw.wall.price) or
                     (tw.wall.side == "bid" and snap.mid <= tw.wall.price)
                 )
-                if age >= self.min_wall_age_sec and was_close and price_crossed:
-                    # реальный пробой: стенка простояла, была близко и цена через неё прошла.
-                    # Пробой ПО тренду не фильтруем - фильтр только против контр-трендовых входов.
-                    side = "long" if tw.wall.side == "ask" else "short"
-                    # Спуфинг-гейт по истории отмен в этой зоне (этап 2.1 аудита,
-                    # 18.08) - zone_cancels_5m раньше только логировался в
-                    # WALL_SCORE, ни на что не влияя. Порог не откалиброван по
-                    # выборке (первая прикидка, как и DEAD_RANGE_MIN_PCT в своё
-                    # время) - см. CFG.spoof_zone_cancel_max, отсечённые кандидаты
-                    # по-прежнему логируются (reason=spoof_zone_cancels), чтобы
-                    # можно было измерить, сколько реально отсекается и куда шла
-                    # цена по факту.
-                    zone_cancels_here = self._zone_cancel_count(tw.wall.side, tw.wall.price)
-                    if zone_cancels_here >= CFG.spoof_zone_cancel_max:
-                        log.info("[%s] BREAKOUT %s у %.2f ПРОПУЩЕН: подозрение на спуфинг зоны "
-                                  "(%d отмен за 5 мин >= %d)", self.symbol, side.upper(), tw.wall.price,
-                                  zone_cancels_here, CFG.spoof_zone_cancel_max)
-                        self._log_wall_candidate(tw, side, snap, age, passed=False,
-                                                  reason="spoof_zone_cancels", signal_type="breakout",
-                                                  price_crossed=True, is_wall_disappearance=True)
-                    else:
+                if was_close:
+                    executed, buy_recent, sell_recent = self._executed_stats(tw.wall.price, age)
+                    zone_cancels = self._zone_cancel_count(tw.wall.side, tw.wall.price)
+                    state, side, reason = self._classify_disappearance(
+                        tw, age, price_crossed, executed, buy_recent, sell_recent, zone_cancels)
+                    self._log_wall_event(tw, side, snap, age, state, reason, executed, buy_recent,
+                                          sell_recent, zone_cancels, event_kind="disappearance")
+                    if state == STATE_BREAKOUT:
                         breakout_signal = Signal(
                             symbol=self.symbol,
                             side=side,
@@ -311,22 +359,19 @@ class SignalEngine:
                             wall_usd=tw.wall.usd,
                             backup_usd=tw.wall.backup_usd,
                         )
-                        self._log_wall_candidate(tw, side, snap, age, passed=True, reason="",
-                                                  signal_type="breakout", price_crossed=True,
-                                                  is_wall_disappearance=True)
-                        log.info("[%s] BREAKOUT %s у %.2f (стенка стояла %.1fs, %.0f USD)",
-                                  self.symbol, side.upper(), tw.wall.price, age, tw.max_usd)
-                else:
-                    # похоже на спуфинг (сняли заявку) или стенка была далеко от рынка.
-                    # Если была близко - фиксируем как отмену в этой зоне (для spoof
-                    # detection - см. _zone_cancel_count) и логируем как кандидата,
-                    # чтобы видеть, куда фактически шла цена после таких отмен.
-                    if was_close:
-                        side = "short" if tw.wall.side == "ask" else "long"  # сторона, которую бы "фейдили"
+                        log.info("[%s] BREAKOUT %s у %.2f (стенка стояла %.1fs, %.0f USD, реально "
+                                  "исполнено %.0f USD)", self.symbol, side.upper(), tw.wall.price, age,
+                                  tw.max_usd, executed["total_usd"])
+                    elif state == STATE_SPOOF:
+                        # Похоже на снятую фейковую заявку - фиксируем как отмену в этой
+                        # зоне (см. _zone_cancel_count), чтобы следующие кандидаты в той
+                        # же зоне видели эту историю.
                         self._record_cancel(tw)
-                        self._log_wall_candidate(tw, side, snap, age, passed=False,
-                                                  reason="cancelled_no_breakout", price_crossed=False,
-                                                  is_wall_disappearance=True)
+                        log.info("[%s] %s у %.2f: %s (side=%s, стояла %.1fs)", self.symbol,
+                                  state, tw.wall.price, reason, side, age)
+                    else:
+                        log.info("[%s] %s у %.2f: %s (side=%s, стояла %.1fs)", self.symbol,
+                                  state, tw.wall.price, reason, side, age)
                 del self.tracked[key]
 
         for key, w in seen_now.items():
@@ -338,164 +383,110 @@ class SignalEngine:
         if breakout_signal:
             return breakout_signal
 
-        if False and trend_state.is_dead:
-            # Отключено СНОВА 18.08 (третий раз за день - см. git-историю):
-            # порог DEAD_RANGE_MIN_PCT/DEAD_RANGE_LOOKBACK_SEC (0.08% за 90с)
-            # ловит только резкий рывок ПРЯМО СЕЙЧАС, а не медленный снос,
-            # растянутый на несколько минут (реальный случай в проде -
-            # диапазон за 90с был 0.01-0.03%, но за 9 минут цена суммарно
-            # прошла ~0.08%) - по ощущению пользователя это не мёртвый рынок,
-            # хотя формально попадает под порог. Раньше пробовали то включать,
-            # то выключать это правило целиком - в этот раз, если понадобится
-            # вернуть, разумнее сначала пересчитать окно/порог (шире
-            # DEAD_RANGE_LOOKBACK_SEC или ниже DEAD_RANGE_MIN_PCT), а не просто
-            # включать обратно то же самое. Код оставлен (if False and ...).
-            # "Мёртвый" рынок - см. TrendState.is_dead/CFG.dead_range_min_pct.
-            # Не глушим BREAKOUT (он уже отработан выше, до этой проверки) -
-            # пробой сам по себе означает, что цена ТОЛЬКО ЧТО вышла из
-            # диапазона, это конец боковика, а не его продолжение. Глушим
-            # только ABSORPTION - именно фейды в обе стороны на одном и том
-            # же шуме и вызывали серию мелких убытков (см. комментарий у
-            # CFG.dead_range_min_pct). Логируем раз в CFG.absorption_min_refire_sec
-            # на стенку не имеет смысла - тут глушим сразу все кандидаты одним
-            # логом, чтобы не спамить.
-            if now - self._last_dead_market_log_ts >= 10.0:
-                log.info("[%s] рынок мёртвый: диапазон %.3f%% за %.0fs < %.3f%% - ABSORPTION приостановлен",
-                          self.symbol, trend_state.range_pct, CFG.dead_range_lookback_sec,
-                          CFG.dead_range_min_pct)
-                self._last_dead_market_log_ts = now
-            return None
+        # Старый блокировщик "мёртвого рынка" (is_dead по узкому диапазону цены)
+        # УДАЛЁН 19.08 (финальный этап рестройки) - он трижды включался/
+        # выключался за один день 18.08 (см. git-историю) и так и не нашёл
+        # рабочего порога (то резал реальные медленные сносы, то пропускал
+        # шум). Заменён по существу: новая классификация ABSORPTION ниже
+        # (_classify_persistence) требует РЕАЛЬНОГО агрессивного исполненного
+        # объёма именно в стенку и ослабевающего давления, а не просто "EMA не
+        # разошлись" - фейды на шуме без реального потока теперь отсеиваются
+        # тем, что для них попросту не набирается aggressive_flow_into_wall,
+        # а не отдельным, плохо откалиброванным индикатором волатильности.
+        # ABSORPTION_FLAT_MIN_VOLATILITY_PCT (см. ниже) остаётся отдельным,
+        # более узким фильтром именно на случай trend=="flat" - тот факт, что
+        # оба применяются вместе, не противоречие, а два разных среза одного
+        # и того же требования "торговать на рывках, а не на боковике".
 
-        # ABSORPTION: ищем стенку, простоявшую достаточно и с накопленным stall_count
-        # ВРЕМЕННО ОТКЛЮЧЕНО 19.08 (CFG.absorption_enabled=False) по прямой просьбе
-        # пользователя - самый слабый по статистике сетап (24.5% винрейт за сутки,
-        # задокументированные серии 8/8 убыточных фейдов в боковике). BREAKOUT
-        # (см. ветку выше, до этого места) продолжает работать как обычно -
-        # отключение касается только этого цикла. Чтобы вернуть - CFG.absorption_enabled=True.
+        # ABSORPTION: классификация РЕАЛЬНОЙ динамики вокруг стенки (см.
+        # _classify_persistence и докстринг модуля) - НЕ факт наличия стенки и
+        # НЕ её размер. Раньше это было отключено (CFG.absorption_enabled=False)
+        # из-за слабой статистики старой (наивной) логики - см. коммент у
+        # CFG.absorption_enabled в config.py, почему теперь снова включено.
         for tw in (self.tracked.values() if CFG.absorption_enabled else ()):
             age = now - tw.first_seen
-            # Требование min_wall_age_sec (2с) ОТКЛЮЧЕНО 18.08 по прямой просьбе
-            # пользователя - после отключения thin_backup именно это стало
-            # следующим узким местом. stall_count >= ABSORPTION_STALL_TICKS
-            # (2 тика подряд с "топтанием" цены) сам по себе уже требует
-            # какого-то времени наблюдения, так что полностью без задержки
-            # сигнал всё равно не будет - но формальный минимум в 2 секунды
-            # больше не гейтит отдельно. Код оставлен закомментированным.
-            age_ok = True  # было: age >= self.min_wall_age_sec
-            if age_ok and tw.stall_count >= CFG.absorption_stall_ticks:
-                # Минимальный интервал между повторными сигналами по ОДНОЙ И ТОЙ
-                # ЖЕ стенке - защита от пачек снепшотов, приходящих почти
-                # одновременно (см. комментарий у _TrackedWall.last_signal_ts).
-                # Не влияет на скорость ПЕРВОГО входа (min_wall_age_sec/
-                # absorption_stall_ticks по-прежнему решают это) - только
-                # глушит бессмысленные повторы одного и того же вывода.
-                if now - tw.last_signal_ts < CFG.absorption_min_refire_sec:
-                    continue
-                side = "short" if tw.wall.side == "ask" else "long"
-                if not TrendFilter.allows_fade(side, trend_state):
-                    continue  # не фейдим против сильного тренда
-                # НОВОЕ 19.08 - см. CFG.absorption_flat_min_volatility_pct: allows_fade
-                # выше блокирует фейд только ПРОТИВ явного тренда, но при trend=="flat"
-                # (боковик) пропускает в обе стороны без ограничений - именно так фейдится
-                # шум без реального движения ("торговать только на рывках, а не на
-                # боковике"). Требуем минимальную реальную волатильность цены, а не
-                # просто "EMA не разошлись".
-                if trend_state.trend == "flat" and \
-                        trend_state.volatility_pct < CFG.absorption_flat_min_volatility_pct:
-                    log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: боковик без движения "
-                              "(volatility_pct=%.4f < %.4f, trend=flat)", self.symbol, side.upper(),
-                              tw.wall.price, trend_state.volatility_pct,
-                              CFG.absorption_flat_min_volatility_pct)
-                    self._log_wall_candidate(tw, side, snap, age, passed=False,
-                                              reason="flat_low_volatility")
-                    tw.stall_count = 0
-                    tw.last_signal_ts = now
-                    continue
-                # Стенка формально крупная, но если сразу за ней (глубже в
-                # стакане) почти нет объёма - это одиночная заявка без
-                # реальной поддержки, и она может не удержать цену.
-                # ОТКЛЮЧЕНО 18.08 по прямой просьбе пользователя - этот гейт
-                # (WALL_BACKUP_MIN_RATIO=15%) резал почти все кандидаты на
-                # активном рынке подряд (реальные стенки $1.5-2М стабильно не
-                # добирали 15% подложки на пару процентов) сразу после того,
-                # как починили спуфинг-фильтр выше - то есть просто следующее
-                # узкое место на пути к любому входу. Код оставлен (проверка
-                # закомментирована), решение о входе теперь не зависит от
-                # backup_usd - если понадобится вернуть, можно отдельно
-                # откалибровать WALL_BACKUP_MIN_RATIO по накопленным
-                # WALL_CANDIDATE/WALL_OUTCOME данным вместо текущих 15% "на глаз".
-                min_backup = tw.wall.usd * CFG.wall_backup_min_ratio
-                if False and tw.wall.backup_usd < min_backup:
-                    log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: тонкая подложка "
-                              "(%.0f USD за стенкой, нужно >= %.0f)",
-                              self.symbol, side.upper(), tw.wall.price, tw.wall.backup_usd, min_backup)
-                    self._log_wall_candidate(tw, side, snap, age, passed=False, reason="thin_backup")
-                    tw.stall_count = 0
-                    # Тот же дебаунс, что и у выданного сигнала (см. last_signal_ts
-                    # выше) - без этого ОТКЛОНЁННЫЙ по тонкой подложке кандидат
-                    # спамит "ПРОПУЩЕН: тонкая подложка" точно так же пачками
-                    # внутри одной группы почти одновременных снепшотов, просто с
-                    # другим текстом лога - обнаружено в проде после первого
-                    # раунда фикса (дебаунс тогда стоял только на пути success).
-                    tw.last_signal_ts = now
-                    continue
-                # Тот же спуфинг-гейт, что и у BREAKOUT выше (этап 2.1 аудита) -
-                # см. комментарий там.
-                zone_cancels_here = self._zone_cancel_count(tw.wall.side, tw.wall.price)
-                if zone_cancels_here >= CFG.spoof_zone_cancel_max:
-                    log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: подозрение на спуфинг зоны "
-                              "(%d отмен за 5 мин >= %d)", self.symbol, side.upper(), tw.wall.price,
-                              zone_cancels_here, CFG.spoof_zone_cancel_max)
-                    self._log_wall_candidate(tw, side, snap, age, passed=False, reason="spoof_zone_cancels")
-                    tw.stall_count = 0
-                    tw.last_signal_ts = now
-                    continue
-                # НОВОЕ 19.08 - прямая жалоба пользователя ("какого хуя открывает
-                # лонг когда лимитка в шорт на 3кк"): вход раньше вообще не
-                # смотрел на ПРОТИВОПОЛОЖНУЮ сторону стакана - решение принималось
-                # только по своей стенке (bid для лонга/ask для шорта), даже если
-                # с другой стороны уже стоит стенка того же или большего калибра,
-                # которая тут же станет сопротивлением. Живой пример из прода:
-                # вход в лонг на bid-стенке 3.1М, а рядом уже стоял ask ~3М -
-                # позиция тут же упиралась и закрывалась в минус по dominance
-                # (см. _thesis_invalidated в order_manager.py - та же логика
-                # "держащая vs встречная", тут применяем ЕЁ ЖЕ на входе, а не
-                # только на выходе). Если встречная сторона УЖЕ доминирует над
-                # нашей стенкой ДО входа - входить бессмысленно, тезис родится
-                # уже мёртвым и тут же схлопнется через dominance-выход.
-                # НЕ применяется к BREAKOUT (см. ветку выше) - там своя стенка
-                # уже пробита, это принципиально другая структура сигнала.
-                opposing_walls = snap.ask_walls if side == "long" else snap.bid_walls
-                if opposing_walls:
-                    nearest_opposing = min(opposing_walls, key=lambda w: w.distance_pct)
-                    if nearest_opposing.usd >= CFG.wall_min_usd and nearest_opposing.usd >= tw.wall.usd:
-                        log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: встречная стенка уже доминирует "
-                                  "(%.0f USD против нашей %.0f USD)", self.symbol, side.upper(),
-                                  tw.wall.price, nearest_opposing.usd, tw.wall.usd)
-                        self._log_wall_candidate(tw, side, snap, age, passed=False,
-                                                  reason="opposing_wall_dominant")
-                        tw.stall_count = 0
-                        tw.last_signal_ts = now
-                        continue
+            if tw.stall_count < CFG.absorption_stall_ticks:
+                continue  # цена вообще ещё не топчется у этой стенки - рано классифицировать
+            # Минимальный интервал между повторными классификациями по ОДНОЙ И
+            # ТОЙ ЖЕ стенке - защита от пачек снепшотов, приходящих почти
+            # одновременно (см. комментарий у _TrackedWall.last_signal_ts).
+            if now - tw.last_signal_ts < CFG.absorption_min_refire_sec:
+                continue
 
-                sig = Signal(
-                    symbol=self.symbol,
-                    side=side,
-                    signal_type="absorption",
-                    reference_price=tw.wall.price,
-                    mid=snap.mid,
-                    confidence=self._confidence(snap, side),
-                    ts=now,
-                    volatility_pct=trend_state.volatility_pct,
-                    wall_usd=tw.wall.usd,
-                    backup_usd=tw.wall.backup_usd,
-                )
-                self._log_wall_candidate(tw, side, snap, age, passed=True, reason="")
-                log.info("[%s] ABSORPTION %s у %.2f (стенка стоит %.1fs, %.0f USD, stall=%d)",
-                          self.symbol, side.upper(), tw.wall.price, age, tw.max_usd, tw.stall_count)
-                tw.stall_count = 0  # чтобы не спамить сигналами каждую секунду
+            side = "short" if tw.wall.side == "ask" else "long"
+            if not TrendFilter.allows_fade(side, trend_state):
+                continue  # не фейдим против сильного тренда - это не NO_EDGE, а просто не проверяем сейчас
+            # allows_fade() блокирует фейд только ПРОТИВ явного тренда - при
+            # trend=="flat" (боковик) пропускает в обе стороны. Требуем
+            # минимальную реальную волатильность цены (не просто "EMA не
+            # разошлись") - см. коммент выше про удалённый is_dead.
+            if trend_state.trend == "flat" and \
+                    trend_state.volatility_pct < CFG.absorption_flat_min_volatility_pct:
+                log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: боковик без движения "
+                          "(volatility_pct=%.4f < %.4f, trend=flat)", self.symbol, side.upper(),
+                          tw.wall.price, trend_state.volatility_pct,
+                          CFG.absorption_flat_min_volatility_pct)
+                tw.stall_count = 0
                 tw.last_signal_ts = now
-                return sig
+                continue
+
+            executed, buy_recent, sell_recent = self._executed_stats(tw.wall.price, age)
+            zone_cancels = self._zone_cancel_count(tw.wall.side, tw.wall.price)
+            state, _side, reason = self._classify_persistence(
+                tw, snap, age, executed, buy_recent, sell_recent, zone_cancels)
+            self._log_wall_event(tw, side, snap, age, state, reason, executed, buy_recent,
+                                  sell_recent, zone_cancels, event_kind="persistence")
+
+            if state != STATE_ABSORPTION:
+                # REAL_WALL/SPOOF/NO_EDGE - стенка есть/интересна, но edge не
+                # подтверждён. NO TRADE - нормальное и частое состояние здесь,
+                # не пытаемся дожать до сигнала дополнительными фильтрами.
+                tw.stall_count = 0
+                tw.last_signal_ts = now
+                continue
+
+            # НОВОЕ 19.08 - прямая жалоба пользователя ("какого хуя открывает
+            # лонг когда лимитка в шорт на 3кк"): решение раньше не смотрело на
+            # ПРОТИВОПОЛОЖНУЮ сторону стакана - если с другой стороны уже стоит
+            # стенка того же/большего калибра, позиция тут же упрётся и
+            # закроется в минус по dominance (см. _thesis_invalidated в
+            # order_manager.py - та же логика "держащая vs встречная", тут
+            # применяем ЕЁ ЖЕ на входе, а не только на выходе). НЕ применяется
+            # к BREAKOUT - там своя стенка уже пробита, другая структура.
+            opposing_walls = snap.ask_walls if side == "long" else snap.bid_walls
+            if opposing_walls:
+                nearest_opposing = min(opposing_walls, key=lambda w: w.distance_pct)
+                if nearest_opposing.usd >= CFG.wall_min_usd and nearest_opposing.usd >= tw.wall.usd:
+                    log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: встречная стенка уже доминирует "
+                              "(%.0f USD против нашей %.0f USD)", self.symbol, side.upper(),
+                              tw.wall.price, nearest_opposing.usd, tw.wall.usd)
+                    tw.stall_count = 0
+                    tw.last_signal_ts = now
+                    continue
+
+            sig = Signal(
+                symbol=self.symbol,
+                side=side,
+                signal_type="absorption",
+                reference_price=tw.wall.price,
+                mid=snap.mid,
+                # Подмешиваем WALL_SCORE (см. _wall_score - size/persistence/
+                # refill/backup/executed/spoof) как мягкую поправку к базовой
+                # confidence, а не жёсткий гейт (см. докстринг модуля - nearby
+                # liquidity/backup участвует именно так, не как hard-порог).
+                confidence=self._confidence(snap, side, boost=0.1 * self._wall_score(
+                    tw, age, executed["total_usd"], zone_cancels)),
+                ts=now,
+                volatility_pct=trend_state.volatility_pct,
+                wall_usd=tw.wall.usd,
+                backup_usd=tw.wall.backup_usd,
+            )
+            log.info("[%s] ABSORPTION %s у %.2f (стенка стоит %.1fs, %.0f USD, реально исполнено "
+                      "%.0f USD, refills=%d)", self.symbol, side.upper(), tw.wall.price, age,
+                      tw.max_usd, executed["total_usd"], tw.refill_count)
+            tw.stall_count = 0  # чтобы не спамить сигналами каждую секунду
+            tw.last_signal_ts = now
+            return sig
 
         return None
 
@@ -508,8 +499,8 @@ class SignalEngine:
         return min(1.0, base + boost)
 
     # ------------------------------------------------------------------ #
-    # Логирование кандидатов + исход через 1/3/5с (калибровочные данные) и
-    # составной WALL_SCORE - см. заголовок файла.
+    # Классификация события ликвидности (REAL_WALL/ABSORPTION/BREAKOUT/SPOOF/
+    # NO_EDGE - см. докстринг модуля) + логирование + исход через 1/3/5с.
     # ------------------------------------------------------------------ #
 
     def _wall_class(self, tw: "_TrackedWall") -> str:
@@ -522,10 +513,11 @@ class SignalEngine:
         """
         Композитный скор 0..1 из компонент, которые по отдельности слабо
         предсказывают исход (см. обсуждение с пользователем - размер стенки
-        сам по себе почти ничего не говорит). НЕ используется пока как жёсткий
-        гейт - только логируется в WALL_CANDIDATE для последующей калибровки
-        по накопленным WALL_OUTCOME (порог "на глаз" здесь так же ненадёжен,
-        как WALL_BACKUP_MIN_RATIO=0.7 оказался ненадёжен на практике).
+        сам по себе почти ничего не говорит). Логируется для каждого события
+        и подмешивается небольшой мягкой поправкой в Signal.confidence (см.
+        on_snapshot) - НЕ используется как отдельный жёсткий гейт (см. коммент
+        у CFG.wall_backup_min_ratio - жёсткий порог по этим же компонентам уже
+        один раз резал почти 100% сигналов).
         """
         size_component = min(tw.wall.usd / max(self.base_wall_min_usd, 1), 3.0) / 3.0
         persistence_component = min(age / (self.min_wall_age_sec * 3), 1.0)
@@ -537,110 +529,157 @@ class SignalEngine:
                  0.15 * backup_component + 0.2 * executed_component + 0.15) - 0.2 * spoof_penalty
         return max(0.0, min(1.0, score))
 
-    def _absorption_shadow_eval(self, tw: "_TrackedWall", side: str, executed_buy: float, executed_sell: float,
-                                 buy_recent: float, sell_recent: float, zone_cancels: int) -> Tuple[bool, dict]:
+    def _executed_stats(self, price: float, age: float) -> Tuple[dict, float, float]:
         """
-        Этап 3 аудита - НЕ гейт, только теневая (WOULD_ENTER/WOULD_SKIP) оценка
-        новых критериев ABSORPTION для последующего сравнения с реальным
-        WALL_OUTCOME (см. AUDIT_2026-08-18.md). Условия по прямому списку из
-        запроса: реальная крупная стенка, есть aggressive flow В стенку, стенка
-        держится, есть refill, давление начинает ослабевать, spoof risk низкий -
-        просто существования стенки недостаточно.
+        Реальный исполненный объём (BinanceTradeFeed) рядом с уровнем price за
+        последние lookback секунд, плюс отдельно "недавняя половина" окна
+        (buy_recent/sell_recent) - нужно, чтобы отличать нарастающий поток от
+        затухающего (см. BinanceTradeFeed.executed_usd_trend), а не одно
+        суммарное число. Общий helper для классификаторов и логирования, чтобы
+        не запрашивать trade_feed дважды за один и тот же тик по одной стенке.
         """
-        # "Атакующий" агрессорский поток - та сторона тейпа, что реально давит
-        # НА стенку: для ask-стенки (блокирует движение вверх) это покупки, для
-        # bid-стенки - продажи.
-        attacking_total = executed_buy if tw.wall.side == "ask" else executed_sell
-        attacking_recent = buy_recent if tw.wall.side == "ask" else sell_recent
-        attacking_older = max(attacking_total - attacking_recent, 0.0)
-
-        criteria = {
-            "real_wall": tw.wall.usd >= self.base_wall_min_usd,
-            "aggressive_flow_into_wall": attacking_total >= tw.wall.usd * CFG.shadow_min_executed_ratio,
-            "wall_holds": tw.update_count >= CFG.absorption_stall_ticks,
-            "refill": tw.refill_count >= 1,
-            # давление ослабевает: недавняя половина окна кормит стенку заметно
-            # меньше, чем более старая половина (после того как поток вообще был).
-            "pressure_weakening": (
-                attacking_older > 0 and attacking_recent <= attacking_older * CFG.shadow_weakening_flow_ratio
-            ),
-            "spoof_risk_low": zone_cancels < CFG.spoof_zone_cancel_max,
-        }
-        return all(criteria.values()), criteria
-
-    def _breakout_shadow_eval(self, tw: "_TrackedWall", side: str, age: float, executed_buy: float,
-                               executed_sell: float, buy_recent: float, sell_recent: float,
-                               zone_cancels: int, price_crossed: bool) -> Tuple[bool, dict]:
-        """
-        Этап 4 аудита - НЕ гейт, теневая оценка новых критериев BREAKOUT.
-        Исчезновение стенки САМО ПО СЕБЕ не считается пробоем - нужно
-        подтверждение реальным исполненным объёмом, что стенку именно съели
-        (а не сняли/отодвинули), продолжение потока в сторону движения, и
-        отсутствие признаков немедленного возврата уровня (приближается через
-        zone_cancels - см. докстринг ниже, это приближение).
-        """
-        total_executed = executed_buy + executed_sell
-        # continuation flow - поток В СТОРОНУ предполагаемого движения ПОСЛЕ
-        # пробоя: long (стенка была ask, съедена вверх) - покупки должны
-        # доминировать в недавнем окне; short - продажи.
-        continuation_recent = buy_recent if side == "long" else sell_recent
-        opposite_recent = sell_recent if side == "long" else buy_recent
-
-        criteria = {
-            "wall_existed_long_enough": age >= CFG.shadow_breakout_min_age_sec,
-            "real_executed_volume": total_executed >= tw.max_usd * CFG.shadow_breakout_min_executed_ratio,
-            "wall_actually_eaten": total_executed >= tw.max_usd * CFG.shadow_breakout_eaten_ratio,
-            "price_passed_level": price_crossed,
-            # Приближение "не было мгновенного refill" - используем ту же
-            # историю отмен по зоне (zone_cancels), а не прямое наблюдение за
-            # тем, появился ли уровень заново через N секунд (это потребовало
-            # бы отдельного forward-looking трекинга, которого сейчас нет) -
-            # НЕДОСТАТОК, если понадобится точнее - надо добавить отдельный
-            # трекер "уровень появился снова в течение Xс после пробоя".
-            "no_recent_spoof_history": zone_cancels < CFG.spoof_zone_cancel_max,
-            "continuation_flow": continuation_recent > opposite_recent,
-        }
-        return all(criteria.values()), criteria
-
-    def _log_wall_candidate(self, tw: "_TrackedWall", side: str, snap: BookSnapshot, age: float,
-                             passed: bool, reason: str, signal_type: str = "absorption",
-                             price_crossed: bool = False, is_wall_disappearance: bool = False) -> Optional[int]:
-        """Возвращает id залогированного кандидата (для привязки shadow_evals -
-        см. этапы 3/4 аудита) или None, если лог пропущен из-за дебаунса.
-        is_wall_disappearance=True - вызов из ветки "стенка пропала" (реальный
-        BREAKOUT или cancelled_no_breakout), а не из ABSORPTION stall-цикла -
-        именно на этом множестве событий имеет смысл breakout_v2 shadow-оценка
-        (см. _breakout_shadow_eval)."""
-        now = time.time()
-        if now - tw.last_candidate_log_ts < CANDIDATE_LOG_COOLDOWN_SEC:
-            return None  # не спамить - одна и та же стенка иначе логируется каждые ~100-300мс
-        tw.last_candidate_log_ts = now
-
         executed = {"buy_usd": 0.0, "sell_usd": 0.0, "total_usd": 0.0}
-        # trend-бакеты (этап 1.4 аудита) - последняя половина lookback-окна vs
-        # вся история, чтобы отличать нарастающий поток от затухающего (см.
-        # BinanceTradeFeed.executed_usd_trend). Используются в этапах 3/4 для
-        # shadow-оценки "давление ослабевает"/"continuation flow", здесь пока
-        # только логируются вместе с кандидатом.
         buy_recent = sell_recent = 0.0
         if self.trade_feed is not None:
             try:
-                lookback = min(age, 30.0)
+                lookback = min(max(age, 0.5), 30.0)
                 executed = self.trade_feed.executed_usd_near(
-                    self.symbol, tw.wall.price, CFG.wall_backup_range_pct, lookback)
+                    self.symbol, price, CFG.wall_backup_range_pct, lookback)
                 trend_buckets = self.trade_feed.executed_usd_trend(
-                    self.symbol, tw.wall.price, CFG.wall_backup_range_pct,
+                    self.symbol, price, CFG.wall_backup_range_pct,
                     lookback_sec=min(lookback, 10.0), buckets=4)
                 half = len(trend_buckets) // 2
                 recent_buckets = trend_buckets[half:] if half else trend_buckets
                 buy_recent = sum(b["buy_usd"] for b in recent_buckets)
                 sell_recent = sum(b["sell_usd"] for b in recent_buckets)
             except Exception:
-                pass  # калибровочный лог не должен ронять основную логику сигналов
+                pass  # калибровочные данные не должны ронять основную логику сигналов
+        return executed, buy_recent, sell_recent
 
-        zone_cancels = self._zone_cancel_count(tw.wall.side, tw.wall.price)
+    def _microprice_bias(self, snap: BookSnapshot) -> float:
+        """>0 - книга взвешена в сторону покупки (см. BookSnapshot.microprice),
+        <0 - в сторону продажи, независимо от того, куда уже сдвинулся mid."""
+        return (snap.microprice - snap.mid) / snap.mid * 100 if snap.mid else 0.0
+
+    def _microprice_weakening(self, side: str) -> bool:
+        """
+        Независимое от исполненного тейпа подтверждение "давление ослабевает" -
+        смотрит не на реальные сделки (BinanceTradeFeed), а на саму книгу
+        (microprice) за последние снепшоты self.history. side - сторона ФЕЙДА
+        (куда бы вошли): "short" значит фейдим ask-стенку, и там ожидаем, что
+        покупательное давление (bias>0, тянет к ask) в недавних тиках слабее,
+        чем было раньше в этом же окне - и наоборот для "long"/bid-стенки.
+        Используется как ИЛИ вместе с pressure_weakening по тейпу в
+        _classify_persistence - две независимые меры одного явления снижают
+        риск того, что одна зашумленная метрика в одиночку решит классификацию.
+        """
+        if len(self.history) < 6:
+            return False
+        biases = [self._microprice_bias(s) for s in self.history]
+        half = len(biases) // 2
+        older, recent = biases[:half], biases[half:]
+        if not older or not recent:
+            return False
+        older_avg = sum(older) / len(older)
+        recent_avg = sum(recent) / len(recent)
+        if side == "short":
+            # фейдим ask - ослабевает покупательное давление (bias>0 -> к 0/отрицательному)
+            return recent_avg <= older_avg * CFG.shadow_weakening_flow_ratio if older_avg > 0 else recent_avg <= 0
+        # фейдим bid (side == "long") - ослабевает продавливающее давление (bias<0 -> к 0/положительному)
+        return recent_avg >= older_avg * CFG.shadow_weakening_flow_ratio if older_avg < 0 else recent_avg >= 0
+
+    def _classify_persistence(self, tw: "_TrackedWall", snap: BookSnapshot, age: float, executed: dict,
+                               buy_recent: float, sell_recent: float, zone_cancels: int) -> Tuple[str, str, str]:
+        """
+        Стенка ещё в книге (не пропала) и цена топчется у неё - классифицирует
+        в REAL_WALL / ABSORPTION / SPOOF / NO_EDGE. Раньше (до рестройки 19.08)
+        это были критерии "теневой" оценки (_absorption_shadow_eval, этап 3
+        аудита 18.08) - теперь это и есть реальный гейт входа (см. коммент у
+        CFG.absorption_enabled и докстринг модуля).
+        """
+        side = "short" if tw.wall.side == "ask" else "long"
+        # "Атакующий" агрессорский поток - та сторона тейпа, что реально давит
+        # НА стенку: для ask-стенки (блокирует движение вверх) это покупки, для
+        # bid-стенки - продажи.
+        attacking_total = executed["buy_usd"] if tw.wall.side == "ask" else executed["sell_usd"]
+        attacking_recent = buy_recent if tw.wall.side == "ask" else sell_recent
+        attacking_older = max(attacking_total - attacking_recent, 0.0)
+
+        real_wall = tw.wall.usd >= self.base_wall_min_usd
+        wall_holds = tw.update_count >= CFG.absorption_stall_ticks
+        spoof_risk_low = zone_cancels < CFG.spoof_zone_cancel_max
+        aggressive_flow_into_wall = attacking_total >= tw.wall.usd * CFG.shadow_min_executed_ratio
+        refill = tw.refill_count >= 1
+        pressure_weakening_flow = (
+            attacking_older > 0 and attacking_recent <= attacking_older * CFG.shadow_weakening_flow_ratio
+        )
+        pressure_weakening = pressure_weakening_flow or self._microprice_weakening(side)
+
+        if not real_wall:
+            return STATE_NO_EDGE, side, "wall_too_small"
+        if not wall_holds:
+            return STATE_NO_EDGE, side, "not_enough_persistence_yet"
+        if not spoof_risk_low:
+            return STATE_SPOOF, side, "spoof_zone_cancels"
+        if aggressive_flow_into_wall and refill and pressure_weakening:
+            return STATE_ABSORPTION, side, ""
+        if not aggressive_flow_into_wall:
+            return STATE_REAL_WALL, side, "holds_without_real_aggressive_flow"
+        return STATE_REAL_WALL, side, "holds_but_no_refill_or_pressure_not_weakening_yet"
+
+    def _classify_disappearance(self, tw: "_TrackedWall", age: float, price_crossed: bool, executed: dict,
+                                 buy_recent: float, sell_recent: float, zone_cancels: int) -> Tuple[str, str, str]:
+        """
+        Стенка реально пропала из книги - классифицирует в BREAKOUT / SPOOF /
+        NO_EDGE. Исчезновение стенки САМО ПО СЕБЕ не считается пробоем (это и
+        была главная слабость старой логики) - нужно подтверждение реальным
+        исполненным объёмом, что стенку именно съели (а не сняли/отодвинули),
+        и продолжение потока в сторону движения ПОСЛЕ исчезновения. Раньше это
+        были критерии "теневой" оценки (_breakout_shadow_eval, этап 4 аудита
+        18.08) - теперь реальный гейт (см. докстринг модуля).
+        """
+        side = "long" if tw.wall.side == "ask" else "short"  # сторона пробоя
+        total_executed = executed["total_usd"]
+        # continuation flow - поток В СТОРОНУ предполагаемого движения ПОСЛЕ
+        # пробоя: long (стенка была ask, съедена вверх) - покупки должны
+        # доминировать в недавнем окне; short - продажи.
+        continuation_recent = buy_recent if side == "long" else sell_recent
+        opposite_recent = sell_recent if side == "long" else buy_recent
+
+        existed_long_enough = age >= self.min_wall_age_sec
+        real_executed_volume = total_executed >= tw.max_usd * CFG.shadow_breakout_min_executed_ratio
+        wall_actually_eaten = total_executed >= tw.max_usd * CFG.shadow_breakout_eaten_ratio
+        continuation_flow = continuation_recent > opposite_recent
+        spoof_risk_low = zone_cancels < CFG.spoof_zone_cancel_max
+
+        if not spoof_risk_low:
+            return STATE_SPOOF, side, "spoof_zone_cancels"
+        if not real_executed_volume:
+            return STATE_SPOOF, side, "vanished_without_real_executed_volume"
+        if existed_long_enough and price_crossed and wall_actually_eaten and continuation_flow:
+            return STATE_BREAKOUT, side, ""
+        if not price_crossed:
+            return STATE_NO_EDGE, side, "eaten_but_price_did_not_follow_through"
+        return STATE_NO_EDGE, side, "insufficient_confirmation"
+
+    def _log_wall_event(self, tw: "_TrackedWall", side: str, snap: BookSnapshot, age: float, state: str,
+                         reason: str, executed: dict, buy_recent: float, sell_recent: float,
+                         zone_cancels: int, event_kind: str) -> Optional[int]:
+        """Логирует классифицированное событие (WALL_CANDIDATE, имя оставлено
+        для совместимости с существующими дашбордами/grep-запросами по
+        Render-логам) + планирует запись исхода через
+        CANDIDATE_OUTCOME_DELAYS_SEC (WALL_OUTCOME) для последующего аудита -
+        независимо от того, породило ли событие реальный Signal. Возвращает id
+        кандидата или None, если лог пропущен из-за дебаунса по стенке."""
+        now = time.time()
+        if now - tw.last_candidate_log_ts < CANDIDATE_LOG_COOLDOWN_SEC:
+            return None  # не спамить - одна и та же стенка иначе логируется каждые ~100-300мс
+        tw.last_candidate_log_ts = now
+
         score = self._wall_score(tw, age, executed["total_usd"], zone_cancels)
         wall_class = self._wall_class(tw)
+        passed = state in (STATE_ABSORPTION, STATE_BREAKOUT)
+        signal_type = "breakout" if event_kind == "disappearance" else "absorption"
 
         cid = next(_next_candidate_id)
         mid0 = snap.mid
@@ -648,42 +687,27 @@ class SignalEngine:
             "[%s] WALL_CANDIDATE id=%d type=%s side=%s price=%.2f size_usd=%.0f backup_usd=%.0f "
             "age=%.1fs stall=%d updates=%d refills=%d class=%s executed_buy=%.0f executed_sell=%.0f "
             "executed_buy_recent=%.0f executed_sell_recent=%.0f zone_cancels_5m=%d score=%.3f "
-            "passed=%s reason=%s mid=%.2f",
+            "state=%s passed=%s reason=%s mid=%.2f",
             self.symbol, cid, signal_type, side, tw.wall.price, tw.wall.usd, tw.wall.backup_usd,
             age, tw.stall_count, tw.update_count, tw.refill_count, wall_class,
             executed["buy_usd"], executed["sell_usd"], buy_recent, sell_recent,
-            zone_cancels, score, passed, reason, mid0,
+            zone_cancels, score, state, passed, reason, mid0,
         )
         if self.event_log is not None:
             self.event_log.log_candidate(
                 cid, self.symbol, signal_type, side, tw.wall.price, tw.wall.usd, tw.wall.backup_usd,
                 age, tw.stall_count, tw.update_count, tw.refill_count, wall_class,
                 executed["buy_usd"], executed["sell_usd"], buy_recent, sell_recent,
-                zone_cancels, score, passed, reason, mid0,
+                zone_cancels, score, passed, f"{state}:{reason}" if reason else state, mid0,
             )
+            try:
+                self.event_log.log_shadow_eval(cid, "classification", passed,
+                                                json.dumps({"state": state, "reason": reason}))
+            except Exception:
+                pass  # калибровочные данные не должны ронять основную логику сигналов
         if passed:
             self._freq_counts[signal_type] = self._freq_counts.get(signal_type, 0) + 1
         self._maybe_log_frequency_summary(now)
-
-        # Shadow-оценка новой ABSORPTION/BREAKOUT логики (этапы 3/4 аудита) -
-        # считается для КАЖДОГО кандидата (не только тех, что прошли текущие
-        # гейты), чтобы можно было сравнить WOULD_ENTER с реальным
-        # WALL_OUTCOME по той же cid независимо от решения текущей логики.
-        # НЕ влияет на sig/breakout_signal - только логирование.
-        if self.event_log is not None:
-            try:
-                if is_wall_disappearance:
-                    would_enter_b, criteria_b = self._breakout_shadow_eval(
-                        tw, side, age, executed["buy_usd"], executed["sell_usd"],
-                        buy_recent, sell_recent, zone_cancels, price_crossed)
-                    self.event_log.log_shadow_eval(cid, "breakout_v2", would_enter_b, json.dumps(criteria_b))
-                else:
-                    would_enter, criteria = self._absorption_shadow_eval(
-                        tw, side, executed["buy_usd"], executed["sell_usd"],
-                        buy_recent, sell_recent, zone_cancels)
-                    self.event_log.log_shadow_eval(cid, "absorption_v2", would_enter, json.dumps(criteria))
-            except Exception:
-                pass  # shadow-логирование не должно ронять основную логику сигналов
 
         for delay in CANDIDATE_OUTCOME_DELAYS_SEC:
             try:
