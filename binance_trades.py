@@ -1,5 +1,5 @@
 """
-Поток РЕАЛЬНЫХ исполненных сделок с Binance Futures (aggTrade) - в отличие от
+Тейп РЕАЛЬНЫХ исполненных сделок с Binance Futures (aggTrade) - в отличие от
 partial-depth снепшотов стакана (binance_feed.py), которые показывают только
 displayed size на уровне, это даёт фактический объём, который через этот
 уровень прошёл. Нужен, чтобы отличать "стенка просто стоит нетронутая" от
@@ -8,176 +8,60 @@ displayed size на уровне, это даёт фактический объ�
 себе почти ничего не говорит, важнее executed_volume и то, восстанавливается
 ли displayed size после fills.
 
-Публичный стрим, без ключей/аккаунта - как и binance_feed.py.
+ВАЖНО (19.08, второй раунд диагностики): раньше этот файл сам открывал
+ОТДЕЛЬНОЕ WS-соединение к Binance (независимо от binance_feed.py). Сначала
+подозревали баг в регистре имени стрима ("aggTrade" vs "aggtrade") - это
+было исправлено, но проблема осталась той же: соединение устанавливалось
+("WS-соединение установлено"), но НИ ОДНОГО сырого сообщения так и не
+приходило, при этом соседний поток стакана (та же цель, тот же IP,
+подключённый РАНЬШЕ) продолжал получать данные без единой проблемы. Это
+указывает на то, что дело не в имени стрима, а в самом факте ВТОРОГО
+одновременного WS-подключения к fstream.binance.com с одного и того же IP -
+см. комментарий в binance_feed.py про то, что IP Render уже словил бан
+(HTTP 418) на REST-запросах раньше, то есть IP общий/уже помеченный
+Binance. Похоже, что для такого IP Binance пускает (handshake проходит), но
+реально не шлёт данные по любому НЕ первому одновременному соединению.
+
+Поэтому эта функциональность (хранение тейпа + запросы по нему) ОТДЕЛЕНА от
+сетевого кода: класс ниже больше не открывает своё WS-соединение - его
+наполняет ЕДИНОЕ соединение из binance_feed.py (там же теперь идёт и подписка
+на aggTrade-стримы, в том же самом сокете, что и стакан). Публичный API
+(executed_usd_near/executed_usd_trend) не изменился - signals.py/
+order_manager.py используют этот объект точно так же, как раньше.
 """
-import asyncio
-import json
 import logging
 import time
 from collections import deque
-from typing import Dict, Optional
-
-try:
-    from websockets.asyncio.client import connect as ws_connect
-except ImportError:  # pragma: no cover - совместимость со старым websockets<13
-    from websockets.client import connect as ws_connect
+from typing import Dict
 
 from exchange_client import MarketInfo
 
 log = logging.getLogger("binance_trades")
 
-WS_BASE = "wss://fstream.binance.com/stream"
 TAPE_KEEP_SEC = 30.0  # сколько секунд сделок держим в памяти на символ
 
 
-def to_stream_name(symbol: str) -> str:
-    # НАЙДЕНО ЭМПИРИЧЕСКИ 19.08 (не по документации, а по факту с прод-логов
-    # Render): при имени стрима "aggTrade" (с большой T, как показано в
-    # официальных доках Binance) WS-хендшейк проходит успешно ("соединение
-    # установлено"), но за установленным соединением НИ РАЗУ не пришло ни
-    # одного сырого сообщения - ни одного - несмотря на то что BTC/ETH на
-    # Binance Futures торгуются по несколько сделок в секунду. Соседний поток
-    # стакана (binance_feed.py, тот же хост, тот же комбинированный стрим-URL,
-    # но имя стрима полностью в нижнем регистре - "depth20@100ms") при этом
-    # получает данные без единой проблемы. Единственное структурное отличие -
-    # регистр имени стрима. Вывод: Binance Futures WS реально матчит имя
-    # стрима только при полном нижнем регистре ("aggtrade"), молча принимая
-    # подписку на несуществующий (из-за регистра) стрим без единой ошибки.
-    return f"{symbol.lower()}usdt@aggtrade"
-
-
 class BinanceTradeFeed:
-    def __init__(self, markets: Dict[str, MarketInfo], on_prolonged_outage=None):
+    """Пассивное хранилище тейпа сделок. Наполняется извне (см.
+    binance_feed.py::_handle_message, ветка aggTrade) через ingest_trade()."""
+
+    def __init__(self, markets: Dict[str, MarketInfo]):
         self.markets = markets
-        self.stream_to_symbol = {to_stream_name(sym): sym for sym in markets}
-        # Резервный индекс по полю "s" самого payload'а aggTrade (например
-        # "BTCUSDT" - Binance всегда отдаёт его в верхнем регистре в самих
-        # данных сделки, независимо от того, как регистрозависимо (или нет)
-        # эхается обратно поле "stream" в конверте комбинированного стрима).
-        # ДОБАВЛЕНО 19.08: диагностика показала, что executed_buy/executed_sell
-        # были ВСЕГДА равны 0 на каждом WALL_CANDIDATE, включая логи ДО
-        # сегодняшнего рефакторинга - т.е. matching по msg["stream"] молча не
-        # срабатывал (return None -> сообщение отбрасывалось без единой
-        # ошибки/предупреждения в логах) с самого начала. Теперь matching
-        # идёт в 3 попытки: точное совпадение stream -> stream.lower() ->
-        # data["s"].upper(), так что бот больше не зависит от того, какой
-        # регистр Binance реально использует в конверте.
-        self._binance_symbol_to_symbol = {f"{sym.upper()}USDT": sym for sym in markets}
         # (ts, price, usd, is_buy_aggressor) - deque в порядке возрастания ts
         self._tape: Dict[str, deque] = {sym: deque() for sym in markets}
-        self._task: Optional[asyncio.Task] = None
-        self.on_prolonged_outage = on_prolonged_outage
-        self._outage_notified = False
         self._first_trade_logged: set = set()
-        self._unmatched_count = 0
-        self._last_unmatched_warn = 0.0
 
-    async def start(self):
-        self._task = asyncio.create_task(self._run_with_reconnect())
-        return self._task
-
-    def _url(self) -> str:
-        streams = "/".join(self.stream_to_symbol.keys())
-        return f"{WS_BASE}?streams={streams}"
-
-    async def _run_with_reconnect(self):
-        # ВАЖНО (диагностика 19.08): раньше здесь был "async for raw in ws:",
-        # который не даёт способа отличить "соединение реально висит без
-        # единого сообщения" от "просто пока тихо" - в логах была только ОДНА
-        # строка "Подключение к WS..." и потом полная тишина часами, без
-        # единой ошибки/переподключения, при том что реальный тейп сделок
-        # (executed_buy/executed_sell) всегда оставался 0. Теперь читаем
-        # сообщения вручную через recv() с таймаутом - это даёт (1) отдельное
-        # подтверждение, что handshake реально завершился, (2) периодический
-        # heartbeat с фактическим счётчиком сырых сообщений, и (3)
-        # принудительный реконнект, если за 20с не пришло вообще ничего -
-        # такого тайм-аута быть не должно в норме (BTC/ETH aggTrade идут по
-        # несколько раз в секунду), так что его срабатывание само по себе
-        # диагностически значимо.
-        backoff = 1
-        consecutive_failures = 0
-        url = self._url()
-        while True:
-            try:
-                log.info("Подключение к WS сделок Binance (%s)...", url)
-                async with ws_connect(url) as ws:
-                    backoff = 1
-                    consecutive_failures = 0
-                    self._outage_notified = False
-                    log.info("binance_trades: WS-соединение установлено, жду сделки...")
-                    last_heartbeat = time.time()
-                    msgs_since_heartbeat = 0
-                    while True:
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=20.0)
-                        except asyncio.TimeoutError:
-                            log.warning("binance_trades: НИ ОДНОГО сырого сообщения от Binance за "
-                                        "последние 20с на установленном соединении - это ненормально "
-                                        "для BTC/ETH aggTrade (обычно несколько сообщений в секунду), "
-                                        "похоже на тихое зависание - принудительно переподключаюсь")
-                            break
-                        msgs_since_heartbeat += 1
-                        self._handle_message(raw)
-                        now_ = time.time()
-                        if now_ - last_heartbeat >= 30:
-                            log.info("binance_trades: heartbeat - %d сырых сообщений за последние "
-                                      "~30с, размеры тейпов: %s", msgs_since_heartbeat,
-                                      {sym: len(t) for sym, t in self._tape.items()})
-                            last_heartbeat = now_
-                            msgs_since_heartbeat = 0
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                consecutive_failures += 1
-                log.warning("Binance trade WS оборвался (%s), переподключение через %ss (попытка %d)",
-                            e, backoff, consecutive_failures)
-                if consecutive_failures >= 5 and not self._outage_notified and self.on_prolonged_outage:
-                    self._outage_notified = True
-                    asyncio.create_task(self.on_prolonged_outage("binance_trades_disconnected"))
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-
-    def _handle_message(self, raw):
-        try:
-            msg = json.loads(raw)
-        except (ValueError, TypeError):
-            return
-        stream = msg.get("stream")
-        data = msg.get("data") or msg
-        # Попытка 1: точное совпадение "stream" с тем, что мы сформировали в
-        # to_stream_name() (например "btcusdt@aggTrade").
-        symbol = self.stream_to_symbol.get(stream)
-        # Попытка 2: то же самое, но в нижнем регистре - на случай, если
-        # Binance эхает "stream" не в том регистре, в котором мы его
-        # запросили (наблюдаемый на практике источник бага: matching молча
-        # не срабатывал ни разу, объём всегда был 0).
-        if symbol is None and stream:
-            symbol = self.stream_to_symbol.get(stream.lower())
-        # Попытка 3: резервный путь через поле "s" самих данных сделки
-        # (например "BTCUSDT") - не зависит от регистра "stream" вообще и
-        # срабатывает даже если формат конверта комбинированного стрима
-        # окажется иным, чем мы предполагаем.
-        if symbol is None:
-            raw_symbol = data.get("s") if isinstance(data, dict) else None
-            if raw_symbol:
-                symbol = self._binance_symbol_to_symbol.get(str(raw_symbol).upper())
-        if symbol is None:
-            self._unmatched_count += 1
-            now_ = time.time()
-            if now_ - self._last_unmatched_warn > 60:
-                self._last_unmatched_warn = now_
-                log.warning("Не удалось сопоставить сделку Binance с символом (stream=%r, "
-                            "data.s=%r) - пропущено %d сообщений за последнюю минуту",
-                            stream, data.get("s") if isinstance(data, dict) else None,
-                            self._unmatched_count)
-                self._unmatched_count = 0
-            return
+    def ingest_trade(self, symbol: str, data: dict) -> bool:
+        """Разбирает payload одной aggTrade-сделки Binance и добавляет её в
+        тейп символа. Возвращает True, если сделка успешно разобрана и
+        добавлена (используется вызывающим кодом только для диагностики/
+        подсчёта, на логику не влияет)."""
         try:
             price = float(data["p"])
             qty = float(data["q"])
             is_buyer_maker = bool(data["m"])
         except (KeyError, TypeError, ValueError):
-            return
+            return False
         # m=True -> покупатель был мейкером -> агрессором была ПРОДАЖА (taker sell).
         # Нас интересует сторона агрессора, а не мейкера.
         is_buy_aggressor = not is_buyer_maker
@@ -191,6 +75,7 @@ class BinanceTradeFeed:
         cutoff = now - TAPE_KEEP_SEC
         while tape and tape[0][0] < cutoff:
             tape.popleft()
+        return True
 
     def executed_usd_near(self, symbol: str, price: float, distance_pct: float, lookback_sec: float) -> dict:
         """
@@ -252,7 +137,3 @@ class BinanceTradeFeed:
             else:
                 result[idx]["sell_usd"] += usd
         return result
-
-    async def stop(self):
-        if self._task:
-            self._task.cancel()
