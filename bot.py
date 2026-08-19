@@ -47,15 +47,21 @@ async def run_trading():
     risk = RiskManager(on_breach=kill_switch.trigger)
 
     md = MarketData(exchange, markets, on_prolonged_outage=kill_switch.trigger)
-    orders = OrderManager(exchange, md, risk, trade_log=trade_log, kill_switch=kill_switch)
-    kill_switch.bind(orders)
 
     binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger) if CFG.use_binance_signals else None
     # Поток реальных исполненных сделок (aggTrade) - отдельно от снепшотов
     # стакана, нужен для "сколько реально прошло объёма у этой стенки", а не
     # только "какой displayed size сейчас видно" (см. binance_trades.py).
+    # Теперь передаётся и в OrderManager (см. ниже) - opposite-flow exit
+    # (19.08, финальный этап рестройки) смотрит на тот же реальный тейп уже
+    # ПОСЛЕ входа, чтобы поймать разворот потока против позиции раньше, чем
+    # он успеет сломать формальную структуру сделки.
     binance_trades = BinanceTradeFeed(markets, on_prolonged_outage=kill_switch.trigger) \
         if CFG.use_binance_signals else None
+
+    orders = OrderManager(exchange, md, risk, trade_log=trade_log, kill_switch=kill_switch,
+                           trade_feed=binance_trades)
+    kill_switch.bind(orders)
 
     trend_filters = {sym: TrendFilter(CFG.trend_ema_fast_sec, CFG.trend_ema_slow_sec,
                                        CFG.vol_lookback, CFG.vol_spike_mult,
@@ -154,15 +160,34 @@ async def run_trading():
         basis_pct = abs(lighter_snap.mid - signal_snap.mid) / lighter_snap.mid * 100 if binance else 0.0
         log.info("[%s] latency signal_age_ms=%.0f basis_pct=%.4f", signal.symbol, signal_age_ms, basis_pct)
 
+        # НОВОЕ 19.08 (финальный этап рестройки стратегии) - прямой пункт из
+        # запроса пользователя: "если сигнал устарел к моменту исполнения на
+        # Lighter - отменить вход". Раньше signal_age_ms только логировался и
+        # ни на что не влиял (см. CFG.max_signal_age_ms в config.py за полное
+        # обоснование порога) - структура (стенка/уровень), на которой строился
+        # сигнал, могла успеть измениться за время задержки между снепшотом
+        # Binance и обработкой ботом, особенно на free tier (Frankfurt, не
+        # гарантированы CPU/сеть).
+        if signal_age_ms > CFG.max_signal_age_ms:
+            log.info("[%s] сигнал %s (%s) ОТМЕНЁН: устарел к моменту исполнения "
+                      "(signal_age_ms=%.0f > %.0f)", signal.symbol, signal.side.upper(),
+                      signal.signal_type, signal_age_ms, CFG.max_signal_age_ms)
+            return
+
         if binance:
-            # basis-проверка: сигнал построен по Binance, но торгуем на Lighter -
-            # если цены разошлись сильнее порога, вход по этому сигналу не оправдан.
-            if basis_pct > CFG.basis_max_divergence_pct:
-                log.warning("[%s] сигнал пропущен: базис Lighter/Binance %.3f%% > порога %.3f%%",
-                            signal.symbol, basis_pct, CFG.basis_max_divergence_pct)
-                return
+            # Порог на разрыв цен Lighter/Binance (BASIS_MAX_DIVERGENCE_PCT) убран
+            # по просьбе пользователя 19.08 - раньше он резал сигналы просто за то,
+            # что биржи разошлись в моменте, хотя расчёт стопа теперь сам поправлен
+            # на этот базис (см. Signal.exchange_basis / risk.build_plan) и уже не
+            # тянет туда межбиржевой шум как ложную "структуру". basis_pct всё ещё
+            # считается и логируется выше - просто больше не блокирует вход.
             # цену/стоп/тейк считаем от РЕАЛЬНОЙ цены исполнения (Lighter), не от Binance
             signal.mid = lighter_snap.mid
+            # См. Signal.exchange_basis в signals.py - risk.build_plan скорректирует
+            # reference_price (стенка, Binance) на этот базис перед расчётом
+            # дистанции стопа, чтобы межбиржевой разброс цен не попадал в стоп
+            # как будто это расстояние до реального уровня в стакане.
+            signal.exchange_basis = lighter_snap.mid - signal_snap.mid
 
         market = markets[signal.symbol]
         asyncio.create_task(orders.handle_signal(market, signal))
