@@ -38,11 +38,27 @@ class BinanceTradeFeed:
     def __init__(self, markets: Dict[str, MarketInfo], on_prolonged_outage=None):
         self.markets = markets
         self.stream_to_symbol = {to_stream_name(sym): sym for sym in markets}
+        # Резервный индекс по полю "s" самого payload'а aggTrade (например
+        # "BTCUSDT" - Binance всегда отдаёт его в верхнем регистре в самих
+        # данных сделки, независимо от того, как регистрозависимо (или нет)
+        # эхается обратно поле "stream" в конверте комбинированного стрима).
+        # ДОБАВЛЕНО 19.08: диагностика показала, что executed_buy/executed_sell
+        # были ВСЕГДА равны 0 на каждом WALL_CANDIDATE, включая логи ДО
+        # сегодняшнего рефакторинга - т.е. matching по msg["stream"] молча не
+        # срабатывал (return None -> сообщение отбрасывалось без единой
+        # ошибки/предупреждения в логах) с самого начала. Теперь matching
+        # идёт в 3 попытки: точное совпадение stream -> stream.lower() ->
+        # data["s"].upper(), так что бот больше не зависит от того, какой
+        # регистр Binance реально использует в конверте.
+        self._binance_symbol_to_symbol = {f"{sym.upper()}USDT": sym for sym in markets}
         # (ts, price, usd, is_buy_aggressor) - deque в порядке возрастания ts
         self._tape: Dict[str, deque] = {sym: deque() for sym in markets}
         self._task: Optional[asyncio.Task] = None
         self.on_prolonged_outage = on_prolonged_outage
         self._outage_notified = False
+        self._first_trade_logged: set = set()
+        self._unmatched_count = 0
+        self._last_unmatched_warn = 0.0
 
     async def start(self):
         self._task = asyncio.create_task(self._run_with_reconnect())
@@ -84,8 +100,33 @@ class BinanceTradeFeed:
             return
         stream = msg.get("stream")
         data = msg.get("data") or msg
+        # Попытка 1: точное совпадение "stream" с тем, что мы сформировали в
+        # to_stream_name() (например "btcusdt@aggTrade").
         symbol = self.stream_to_symbol.get(stream)
+        # Попытка 2: то же самое, но в нижнем регистре - на случай, если
+        # Binance эхает "stream" не в том регистре, в котором мы его
+        # запросили (наблюдаемый на практике источник бага: matching молча
+        # не срабатывал ни разу, объём всегда был 0).
+        if symbol is None and stream:
+            symbol = self.stream_to_symbol.get(stream.lower())
+        # Попытка 3: резервный путь через поле "s" самих данных сделки
+        # (например "BTCUSDT") - не зависит от регистра "stream" вообще и
+        # срабатывает даже если формат конверта комбинированного стрима
+        # окажется иным, чем мы предполагаем.
         if symbol is None:
+            raw_symbol = data.get("s") if isinstance(data, dict) else None
+            if raw_symbol:
+                symbol = self._binance_symbol_to_symbol.get(str(raw_symbol).upper())
+        if symbol is None:
+            self._unmatched_count += 1
+            now_ = time.time()
+            if now_ - self._last_unmatched_warn > 60:
+                self._last_unmatched_warn = now_
+                log.warning("Не удалось сопоставить сделку Binance с символом (stream=%r, "
+                            "data.s=%r) - пропущено %d сообщений за последнюю минуту",
+                            stream, data.get("s") if isinstance(data, dict) else None,
+                            self._unmatched_count)
+                self._unmatched_count = 0
             return
         try:
             price = float(data["p"])
@@ -97,6 +138,10 @@ class BinanceTradeFeed:
         # Нас интересует сторона агрессора, а не мейкера.
         is_buy_aggressor = not is_buyer_maker
         now = time.time()
+        if symbol not in self._first_trade_logged:
+            self._first_trade_logged.add(symbol)
+            log.info("binance_trades: первая исполненная сделка получена для %s (цена=%.2f) - "
+                      "тейп реально наполняется", symbol, price)
         tape = self._tape.setdefault(symbol, deque())
         tape.append((now, price, price * qty, is_buy_aggressor))
         cutoff = now - TAPE_KEEP_SEC
