@@ -333,6 +333,13 @@ class Config:
     # У Lighter стакан тоньше, чем у Binance - крупные заявки на Binance надёжнее
     # отражают реальный интерес. Исполнение всё равно на Lighter (0 комиссий).
     use_binance_signals: bool = field(default_factory=lambda: _s("USE_BINANCE_SIGNALS", "true").lower() == "true")
+    # ВРЕМЕННО ОТКЛЮЧЕНО 19.08 по прямой просьбе пользователя ("давай временно
+    # его отключим") - ABSORPTION (фейд от стенки) статистически самый слабый
+    # сетап: 24.5% винрейт за сутки, задокументированные случаи 8/8 убыточных
+    # фейдов подряд в боковике. BREAKOUT (реальный пробой стенки) остаётся
+    # включён - см. signals.py, там же сам гейт (absorption_enabled). Легко
+    # вернуть обратно - просто True.
+    absorption_enabled: bool = field(default_factory=lambda: _s("ABSORPTION_ENABLED", "false").lower() == "true")
     # WebSocket partial book depth: сколько уровней (5/10/20) и с какой скоростью
     # обновления (100/250/500 мс). REST-поллинг не используется - Binance банит IP
     # за превышение веса запросов (см. binance_feed.py), WS для market-data так не тарифицируется.
