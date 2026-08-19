@@ -66,6 +66,12 @@ async def run_trading():
                for sym in markets}
 
     latest_lighter_snap: Dict[str, "BookSnapshot"] = {}
+    # См. CFG.startup_grace_sec - первые N секунд после запуска процесса сигналы
+    # не обрабатываем вообще (ни на вход, ни на разворот) - стакан/wall-tracking
+    # ещё не устаканились после свежего WS-коннекта, особенно после free-tier
+    # рестарта Render (см. комментарий у startup_grace_sec в config.py).
+    process_start_ts = time.time()
+    _startup_grace_logged = False
 
     dashboard = Dashboard(risk, orders, trade_log, kill_switch, CFG.dashboard_port, CFG.mode, list(markets.keys()))
     await dashboard.start()
@@ -114,6 +120,23 @@ async def run_trading():
         engine = engines[signal_snap.symbol]
         signal = engine.on_snapshot(signal_snap)
         if signal is None:
+            return
+
+        # См. CFG.startup_grace_sec - первые секунды после запуска процесса
+        # сигналы НЕ отбрасываем молча в on_snapshot (там wall-tracking должен
+        # продолжать копиться и прогреваться нормально), а глушим именно тут,
+        # на выходе - чтобы не открывать сделки на ещё не устаканившемся стакане
+        # сразу после (пере)запуска процесса. on_snapshot() выше всё равно
+        # выполняется каждый тик ради прогрева self.tracked - иначе к моменту
+        # окончания грейс-периода стенки пришлось бы отслеживать заново с нуля.
+        nonlocal _startup_grace_logged
+        since_start = time.time() - process_start_ts
+        if since_start < CFG.startup_grace_sec:
+            if not _startup_grace_logged:
+                log.info("[%s] сигнал %s пропущен: стартовый грейс-период (%.0fs из %.0fs после запуска "
+                          "процесса) - стакан ещё не устаканился", signal.symbol, signal.side.upper(),
+                          since_start, CFG.startup_grace_sec)
+                _startup_grace_logged = True
             return
 
         log.info("[%s] СИГНАЛ %s (%s) confidence=%.2f у цены %.2f (источник: %s)",
