@@ -48,7 +48,6 @@ async def run_trading():
 
     md = MarketData(exchange, markets, on_prolonged_outage=kill_switch.trigger)
 
-    binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger) if CFG.use_binance_signals else None
     # Поток реальных исполненных сделок (aggTrade) - отдельно от снепшотов
     # стакана, нужен для "сколько реально прошло объёма у этой стенки", а не
     # только "какой displayed size сейчас видно" (см. binance_trades.py).
@@ -56,7 +55,15 @@ async def run_trading():
     # (19.08, финальный этап рестройки) смотрит на тот же реальный тейп уже
     # ПОСЛЕ входа, чтобы поймать разворот потока против позиции раньше, чем
     # он успеет сломать формальную структуру сделки.
-    binance_trades = BinanceTradeFeed(markets, on_prolonged_outage=kill_switch.trigger) \
+    # ВАЖНО (19.08, второй раунд диагностики "ни одной сделки не открылось"):
+    # BinanceTradeFeed больше НЕ открывает своё отдельное WS-соединение (это
+    # и было причиной бага - второе одновременное соединение к Binance с
+    # одного и того же уже помеченного/rate-limited IP Render молча не
+    # получало данных). Теперь это пассивное хранилище, которое наполняет
+    # ЕДИНОЕ соединение BinanceFeed (см. binance_feed.py) - поэтому создаём
+    # его первым и передаём в BinanceFeed как trade_feed.
+    binance_trades = BinanceTradeFeed(markets) if CFG.use_binance_signals else None
+    binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger, trade_feed=binance_trades) \
         if CFG.use_binance_signals else None
 
     orders = OrderManager(exchange, md, risk, trade_log=trade_log, kill_switch=kill_switch,
@@ -85,8 +92,6 @@ async def run_trading():
     await md.start()
     if binance:
         await binance.start()
-    if binance_trades:
-        await binance_trades.start()
     log.info("Бот запущен в режиме MODE=%s | символы: %s | депозит=%.2f USD | риск/сделка=%.1f%% | "
               "источник сигнала=%s | дашборд на порту %d",
               CFG.mode, ", ".join(markets.keys()), CFG.account_equity_usd, CFG.risk_per_trade_pct,
@@ -245,8 +250,6 @@ async def run_trading():
         await md.stop()
         if binance:
             await binance.stop()
-        if binance_trades:
-            await binance_trades.stop()
         await exchange.close()
         trade_log.close()
         wall_events.close()
