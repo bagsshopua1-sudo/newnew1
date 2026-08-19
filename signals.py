@@ -389,6 +389,23 @@ class SignalEngine:
                 side = "short" if tw.wall.side == "ask" else "long"
                 if not TrendFilter.allows_fade(side, trend_state):
                     continue  # не фейдим против сильного тренда
+                # НОВОЕ 19.08 - см. CFG.absorption_flat_min_volatility_pct: allows_fade
+                # выше блокирует фейд только ПРОТИВ явного тренда, но при trend=="flat"
+                # (боковик) пропускает в обе стороны без ограничений - именно так фейдится
+                # шум без реального движения ("торговать только на рывках, а не на
+                # боковике"). Требуем минимальную реальную волатильность цены, а не
+                # просто "EMA не разошлись".
+                if trend_state.trend == "flat" and \
+                        trend_state.volatility_pct < CFG.absorption_flat_min_volatility_pct:
+                    log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: боковик без движения "
+                              "(volatility_pct=%.4f < %.4f, trend=flat)", self.symbol, side.upper(),
+                              tw.wall.price, trend_state.volatility_pct,
+                              CFG.absorption_flat_min_volatility_pct)
+                    self._log_wall_candidate(tw, side, snap, age, passed=False,
+                                              reason="flat_low_volatility")
+                    tw.stall_count = 0
+                    tw.last_signal_ts = now
+                    continue
                 # Стенка формально крупная, но если сразу за ней (глубже в
                 # стакане) почти нет объёма - это одиночная заявка без
                 # реальной поддержки, и она может не удержать цену.
