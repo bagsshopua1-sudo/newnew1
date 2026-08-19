@@ -428,6 +428,34 @@ class SignalEngine:
                     tw.stall_count = 0
                     tw.last_signal_ts = now
                     continue
+                # НОВОЕ 19.08 - прямая жалоба пользователя ("какого хуя открывает
+                # лонг когда лимитка в шорт на 3кк"): вход раньше вообще не
+                # смотрел на ПРОТИВОПОЛОЖНУЮ сторону стакана - решение принималось
+                # только по своей стенке (bid для лонга/ask для шорта), даже если
+                # с другой стороны уже стоит стенка того же или большего калибра,
+                # которая тут же станет сопротивлением. Живой пример из прода:
+                # вход в лонг на bid-стенке 3.1М, а рядом уже стоял ask ~3М -
+                # позиция тут же упиралась и закрывалась в минус по dominance
+                # (см. _thesis_invalidated в order_manager.py - та же логика
+                # "держащая vs встречная", тут применяем ЕЁ ЖЕ на входе, а не
+                # только на выходе). Если встречная сторона УЖЕ доминирует над
+                # нашей стенкой ДО входа - входить бессмысленно, тезис родится
+                # уже мёртвым и тут же схлопнется через dominance-выход.
+                # НЕ применяется к BREAKOUT (см. ветку выше) - там своя стенка
+                # уже пробита, это принципиально другая структура сигнала.
+                opposing_walls = snap.ask_walls if side == "long" else snap.bid_walls
+                if opposing_walls:
+                    nearest_opposing = min(opposing_walls, key=lambda w: w.distance_pct)
+                    if nearest_opposing.usd >= CFG.wall_min_usd and nearest_opposing.usd >= tw.wall.usd:
+                        log.info("[%s] ABSORPTION %s у %.2f ПРОПУЩЕН: встречная стенка уже доминирует "
+                                  "(%.0f USD против нашей %.0f USD)", self.symbol, side.upper(),
+                                  tw.wall.price, nearest_opposing.usd, tw.wall.usd)
+                        self._log_wall_candidate(tw, side, snap, age, passed=False,
+                                                  reason="opposing_wall_dominant")
+                        tw.stall_count = 0
+                        tw.last_signal_ts = now
+                        continue
+
                 sig = Signal(
                     symbol=self.symbol,
                     side=side,
