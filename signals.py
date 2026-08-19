@@ -367,7 +367,12 @@ class SignalEngine:
             return None
 
         # ABSORPTION: ищем стенку, простоявшую достаточно и с накопленным stall_count
-        for tw in self.tracked.values():
+        # ВРЕМЕННО ОТКЛЮЧЕНО 19.08 (CFG.absorption_enabled=False) по прямой просьбе
+        # пользователя - самый слабый по статистике сетап (24.5% винрейт за сутки,
+        # задокументированные серии 8/8 убыточных фейдов в боковике). BREAKOUT
+        # (см. ветку выше, до этого места) продолжает работать как обычно -
+        # отключение касается только этого цикла. Чтобы вернуть - CFG.absorption_enabled=True.
+        for tw in (self.tracked.values() if CFG.absorption_enabled else ()):
             age = now - tw.first_seen
             # Требование min_wall_age_sec (2с) ОТКЛЮЧЕНО 18.08 по прямой просьбе
             # пользователя - после отключения thin_backup именно это стало
