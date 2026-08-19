@@ -43,7 +43,10 @@ class Config:
     wall_max_distance_pct: float = field(default_factory=lambda: _f("WALL_MAX_DISTANCE_PCT", 0.3))
     imbalance_threshold: float = field(default_factory=lambda: _f("IMBALANCE_THRESHOLD", 0.65))
 
-    account_equity_usd: float = field(default_factory=lambda: _f("ACCOUNT_EQUITY_USD", 1000))
+    # Снижено с 1000 до 100 по прямой просьбе пользователя 19.08 ("баланс на
+    # 100 баксов") - вместе с MAX_LEVERAGE=50 ниже это тестовый режим с высоким
+    # плечом на маленьком депозите (прямо отмечено пользователем как тест).
+    account_equity_usd: float = field(default_factory=lambda: _f("ACCOUNT_EQUITY_USD", 100))
     risk_per_trade_pct: float = field(default_factory=lambda: _f("RISK_PER_TRADE_PCT", 1.0))
     # Запасной вариант для build_plan(), если по какой-то причине нет уровня-опоры
     # (сигнальной стенки) - в норме не используется, стоп считается от структуры.
@@ -72,7 +75,19 @@ class Config:
     rr_target_1: float = field(default_factory=lambda: _f("RR_TARGET_1", 1.5))
     take_profit_1_size: float = field(default_factory=lambda: _f("TAKE_PROFIT_1_SIZE", 0.5))
     trailing_stop_pct: float = field(default_factory=lambda: _f("TRAILING_STOP_PCT", 0.4))
-    max_leverage: float = field(default_factory=lambda: _f("MAX_LEVERAGE", 3))
+    # Поднято с 3 до 50 по прямой просьбе пользователя 19.08 ("открытие сделок
+    # с 50 плечом... это тест") - вместе с ACCOUNT_EQUITY_USD=100 выше. ВАЖНО:
+    # это ТОЛЬКО поднимает потолок max_notional в risk.build_plan
+    # (self.equity * max_leverage) - фактический размер позиции по-прежнему
+    # считается от risk_per_trade_pct и структурной стоп-дистанции (см.
+    # risk.build_plan: raw_size = risk_usd / stop_distance) и лишь ЗАЖИМАЕТСЯ
+    # этим потолком, если бы иначе получился больше. При узком структурном
+    # стопе (частый случай у micro-scalping входов прямо у стенки) raw_size
+    # на маленьком депозите легко упирается в потолок раньше, чем в
+    # risk_per_trade_pct - высокое плечо тут в первую очередь снимает именно
+    # этот искусственный потолок, а не меняет то, сколько бот готов
+    # рискнуть в USD на сделку.
+    max_leverage: float = field(default_factory=lambda: _f("MAX_LEVERAGE", 50))
     daily_loss_limit_pct: float = field(default_factory=lambda: _f("DAILY_LOSS_LIMIT_PCT", 3.0))
     max_consecutive_losses: int = field(default_factory=lambda: _i("MAX_CONSECUTIVE_LOSSES", 3))
     cooldown_minutes: float = field(default_factory=lambda: _f("COOLDOWN_MINUTES", 120))
@@ -333,13 +348,20 @@ class Config:
     # У Lighter стакан тоньше, чем у Binance - крупные заявки на Binance надёжнее
     # отражают реальный интерес. Исполнение всё равно на Lighter (0 комиссий).
     use_binance_signals: bool = field(default_factory=lambda: _s("USE_BINANCE_SIGNALS", "true").lower() == "true")
-    # ВРЕМЕННО ОТКЛЮЧЕНО 19.08 по прямой просьбе пользователя ("давай временно
-    # его отключим") - ABSORPTION (фейд от стенки) статистически самый слабый
-    # сетап: 24.5% винрейт за сутки, задокументированные случаи 8/8 убыточных
-    # фейдов подряд в боковике. BREAKOUT (реальный пробой стенки) остаётся
-    # включён - см. signals.py, там же сам гейт (absorption_enabled). Легко
-    # вернуть обратно - просто True.
-    absorption_enabled: bool = field(default_factory=lambda: _s("ABSORPTION_ENABLED", "false").lower() == "true")
+    # СНОВА ВКЛЮЧЕНО 19.08 (финальный этап рестройки стратегии) - раньше было
+    # отключено, потому что ABSORPTION определялся по наивному критерию
+    # "стенка есть и цена топчется N тиков подряд" (24.5% винрейт за сутки,
+    # задокументированные случаи 8/8 убыточных фейдов подряд в боковике) - т.е.
+    # именно по РАЗМЕРУ/факту наличия стенки, без понимания, что реально
+    # происходит вокруг неё. Классификация ABSORPTION теперь построена на
+    # реальной динамике (см. SignalEngine._classify_persistence в signals.py):
+    # агрессивный исполненный объём именно В стенку (BinanceTradeFeed), refill,
+    # ослабевающее давление (и по тейпу, и независимо по microprice), низкий
+    # риск спуфинга по истории отмен зоны - это ровно те критерии, что раньше
+    # только логировались как WOULD_ENTER (shadow_evals) и не использовались
+    # как реальный гейт. Включаем обратно вместе с переходом на этот гейт,
+    # а не на старую логику.
+    absorption_enabled: bool = field(default_factory=lambda: _s("ABSORPTION_ENABLED", "true").lower() == "true")
     # WebSocket partial book depth: сколько уровней (5/10/20) и с какой скоростью
     # обновления (100/250/500 мс). REST-поллинг не используется - Binance банит IP
     # за превышение веса запросов (см. binance_feed.py), WS для market-data так не тарифицируется.
@@ -352,21 +374,34 @@ class Config:
     binance_wall_min_usd: float = field(default_factory=lambda: _f("BINANCE_WALL_MIN_USD", 1_500_000))
     # Если цена Lighter разошлась с Binance больше чем на столько % - сигнал с
     # Binance пропускаем: базис слишком большой, вход по нему не оправдан.
-    # НАЙДЕНО В ПРОДЕ 19.08 - прямая жалоба пользователя "10 минут ни одной
-    # сделки, рынок летит". По живым логам за 15:25-15:38 порог 0.15% резал
-    # АБСОЛЮТНО ВСЕ сигналы без исключения - не только на пике резкого рывка
-    # (BTC 1.78-3.7%, ETH 3.1-5.9% в 15:25-15:30), но и после того как рынок
-    # успокоился (ETH стабильно 0.24-0.71%, BTC 0.38-0.4% в 15:31-15:38) - то
-    # есть 0.15% нереалистичен для текущей ликвидности Lighter даже в спокойном
-    # состоянии, это не только про моменты резких движений. Поднято до 0.8% -
-    # с запасом покрывает наблюдённый "спокойный" диапазон (0.24-0.71%), но
-    # всё ещё режет реально экстремальные значения (1.78%+), которые были на
-    # самом пике рывка. НЕ откалибровано по большой выборке (как и было с
-    # is_dead/ABSORPTION_FLAT_MIN_VOLATILITY_PCT) - основано на одном живом
-    # 15-минутном окне, смотрим по логам дальше и поправим по факту, если
-    # 0.8% окажется всё ещё слишком туго или наоборот пропустит вход по цене,
-    # которая разошлась с сигналом до неоправданности.
-    basis_max_divergence_pct: float = field(default_factory=lambda: _f("BASIS_MAX_DIVERGENCE_PCT", 0.8))
+    # BASIS_MAX_DIVERGENCE_PCT убран 19.08 по прямой просьбе пользователя -
+    # порог резал сигналы просто из-за того, что Lighter и Binance разошлись
+    # в моменте (это НЕ про рынок, это межбиржевой шум), а расчёт стопа теперь
+    # сам корректируется на этот базис (см. Signal.exchange_basis в signals.py
+    # и risk.build_plan) - раньше именно из-за некорректированного стопа порог
+    # казался нужен, теперь этот источник кривизны устранён в другом месте, и
+    # блокировать вход по самому базису смысла нет. basis_pct по-прежнему
+    # считается в bot.py и виден в логах - просто больше ни на что не влияет.
+
+    # === Отмена входа по устаревшему сигналу (19.08, финальный этап рестройки) ===
+    # Прямой пункт из запроса пользователя: "если сигнал устарел к моменту
+    # исполнения на Lighter - отменить вход". signal_age_ms (время между
+    # снепшотом Binance, породившим сигнал, и моментом, когда бот его
+    # обработал) раньше только логировался (см. bot.py, "latency
+    # signal_age_ms=..."), но НИКАК не влиял на решение входить или нет - на
+    # free tier (Frankfurt, не гарантированы CPU/сеть) это значит, что бот мог
+    # пытаться исполнить сигнал, структура которого уже могла успеть
+    # измениться за время задержки. 400мс - компромисс: штатная задержка
+    # между снепшотами Binance WS (BINANCE_WS_SPEED_MS=500) уже сама по себе
+    # означает, что "мгновенных" (0-50мс) сигналов в норме почти не бывает, а
+    # реальные наблюдавшиеся в проде обработки укладывались в низкие сотни мс
+    # (см. комментарий у signal_age_ms в bot.py, "условно 300+ мс" уже
+    # называлось поводом для беспокойства) - 400мс режет именно аномальные
+    # случаи (просевший процесс, GC-пауза, скачок сети), а не обычный рабочий
+    # джиттер. НЕ откалибровано по большой выборке - как и другие пороги этого
+    # рестройки, отклонённые по этой причине сигналы логируются отдельной
+    # строкой, чтобы можно было проверить по логам, не режет ли слишком много.
+    max_signal_age_ms: float = field(default_factory=lambda: _f("MAX_SIGNAL_AGE_MS", 400.0))
 
     # === Задержка подтверждения сигнала (было жёстко зашито в signals.py) ===
     # Стенка должна простоять минимум столько секунд, прежде чем считаться
@@ -511,19 +546,70 @@ class Config:
     # (срабатывает не больше одного раза за сделку - см. ManagedPosition.weakening_partial_done).
     weakening_partial_close_pct: float = field(default_factory=lambda: _f("WEAKENING_PARTIAL_CLOSE_PCT", 0.3))
 
-    # === Shadow-режим для новой ABSORPTION/BREAKOUT логики (аудит, этап 3/4) ===
-    # ВАЖНО: эти пороги НЕ гейтят реальные сигналы - только логируются как
-    # WOULD_ENTER/WOULD_SKIP в wall_event_log.py (shadow_evals) для сравнения с
-    # реальным исходом (WALL_OUTCOME) ПОСЛЕ накопления данных, по прямой
-    # договорённости с пользователем ("не оптимизируй пороги, пока не
-    # накопится достаточно данных"). Все значения ниже - первые прикидки,
-    # не откалиброваны.
+    # === Пороги классификации событий ликвидности (было "shadow-режим" этапов
+    # 3/4 аудита 18.08 - ПРОМОУШЕН в реальный гейт 19.08, финальный этап
+    # рестройки стратегии) ===
+    # До этого момента эти же самые критерии (executed volume у стенки, refill,
+    # ослабевающее давление, возраст стенки, реально съеденный объём,
+    # continuation flow) только ЛОГИРОВАЛИСЬ как WOULD_ENTER/WOULD_SKIP в
+    # wall_event_log.py и ни на что не влияли - по прямой договорённости с
+    # пользователем "не оптимизируй пороги, пока не накопится достаточно
+    # данных". Теперь это и есть реальная логика классификации REAL_WALL /
+    # ABSORPTION / BREAKOUT / SPOOF / NO_EDGE (см. SignalEngine._classify_persistence/
+    # _classify_disappearance в signals.py) - главный рычаг всей рестройки:
+    # решение "входить или нет" принимается по динамике вокруг стенки
+    # (persistence/executed volume/refill/flow trend/microprice), а не по
+    # факту "стенка появилась/исчезла" и не по её голому размеру. Имена
+    # SHADOW_* оставлены как есть (не переименовываем ENV-переменные, которые
+    # уже могли быть выставлены на Render) - смысл теперь другой, см. коммент.
     shadow_min_executed_ratio: float = field(default_factory=lambda: _f("SHADOW_MIN_EXECUTED_RATIO", 0.15))
     shadow_weakening_flow_ratio: float = field(default_factory=lambda: _f("SHADOW_WEAKENING_FLOW_RATIO", 0.7))
     shadow_breakout_min_age_sec: float = field(default_factory=lambda: _f("SHADOW_BREAKOUT_MIN_AGE_SEC", 4.0))
     shadow_breakout_min_executed_ratio: float = field(
         default_factory=lambda: _f("SHADOW_BREAKOUT_MIN_EXECUTED_RATIO", 0.2))
     shadow_breakout_eaten_ratio: float = field(default_factory=lambda: _f("SHADOW_BREAKOUT_EATEN_RATIO", 0.5))
+
+    # === Opposite-flow exit (19.08, финальный этап рестройки) ===
+    # Новый тип "умного" выхода из явного списка требований пользователя,
+    # отдельный от THESIS INVALIDATED (структура своей стенки сломалась) и
+    # THESIS WEAKENING (цена откатила от MFE) - здесь смотрим на реальный
+    # исполненный поток (BinanceTradeFeed) РЯДОМ С ТЕКУЩЕЙ ЦЕНОЙ (а не у
+    # стенки входа), независимо от того, что происходит со структурой самой
+    # стенки: если агрессивный объём в последних секундах явно течёт ПРОТИВ
+    # позиции - это опережающий признак того, что edge, на котором строился
+    # вход, уже исчез, даже если формальная структура (стенка/уровень) ещё не
+    # успела развалиться. Использует ТУ ЖЕ функцию executed_usd_trend, что и
+    # классификация входа (см. signals.py) - тот же принцип "смотреть на
+    # динамику, а не на статичный снимок" применён и на выходе.
+    opposite_flow_range_pct: float = field(default_factory=lambda: _f("OPPOSITE_FLOW_RANGE_PCT", 0.5))
+    opposite_flow_lookback_sec: float = field(default_factory=lambda: _f("OPPOSITE_FLOW_LOOKBACK_SEC", 6.0))
+    # Минимальный суммарный объём (buy+sell) за окно, ниже которого поток
+    # считается слишком разреженным, чтобы вообще судить о его направлении -
+    # без этого порога случайные 2-3 сделки могли бы решить исход в любую
+    # сторону просто по шуму.
+    opposite_flow_min_total_usd: float = field(default_factory=lambda: _f("OPPOSITE_FLOW_MIN_TOTAL_USD", 300_000))
+    # Встречный поток должен ПРЕОБЛАДАТЬ, а не просто немного перевесить -
+    # решительный разворот потока, а не 50/50.
+    opposite_flow_dominance_ratio: float = field(default_factory=lambda: _f("OPPOSITE_FLOW_DOMINANCE_RATIO", 1.5))
+    # Тот же принцип debounce, что и у wall_dominance_confirm_ticks - разовый
+    # шумный тик потока не должен закрывать позицию сам по себе.
+    opposite_flow_confirm_ticks: int = field(default_factory=lambda: _i("OPPOSITE_FLOW_CONFIRM_TICKS", 3))
+
+    # === Dynamic profit taking - трейлинг, подтягивающийся быстрее по мере
+    # роста MFE (19.08, финальный этап рестройки) ===
+    # Прямое требование пользователя ("не жди только фиксированный TP/SL",
+    # "dynamic profit taking"). Раньше TRAILING_STOP_PCT был одним и тем же
+    # фиксированным % от пика независимо от того, насколько далеко сделка уже
+    # прошла в нашу пользу - отдать одну и ту же долю уже накопленного пути
+    # разумно, когда путь небольшой, но по мере роста MFE относительно
+    # исходной стоп-дистанции (риска на сделку) отдавать назад ту же долю
+    # означает отдавать всё больше и больше в абсолютном выражении. Подтягиваем
+    # трейлинг ступенчато: чем больше MFE относительно исходного риска - тем
+    # уже % трейлинга от пика (см. OrderManager._effective_trailing_pct).
+    dynamic_trailing_mfe_mult_1: float = field(default_factory=lambda: _f("DYNAMIC_TRAILING_MFE_MULT_1", 2.0))
+    dynamic_trailing_tighten_pct_1: float = field(default_factory=lambda: _f("DYNAMIC_TRAILING_TIGHTEN_PCT_1", 0.6))
+    dynamic_trailing_mfe_mult_2: float = field(default_factory=lambda: _f("DYNAMIC_TRAILING_MFE_MULT_2", 4.0))
+    dynamic_trailing_tighten_pct_2: float = field(default_factory=lambda: _f("DYNAMIC_TRAILING_TIGHTEN_PCT_2", 0.35))
 
     def validate(self):
         assert self.mode in ("collect", "paper", "live"), f"Неизвестный MODE={self.mode}"
