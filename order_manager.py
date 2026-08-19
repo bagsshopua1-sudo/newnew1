@@ -506,15 +506,30 @@ class OrderManager:
                         # на закрытие мог бы попытаться закрыть больше, чем реально
                         # осталось от позиции.
                         remaining_tp1 = min(pos.plan.tp1_size - pos.tp1_filled, pos.filled_size)
-                        if remaining_tp1 <= 1e-9:
-                            # WEAKENING уже закрыл не меньше, чем предполагал план TP1 -
-                            # по факту план TP1 выполнен остатком позиции.
+                        # НАЙДЕНО В ПРОДЕ 19.08 - реальный баг, не гипотеза: ETH-сделка
+                        # застряла в бесконечном цикле на ~95 секунд (11:20:00-11:21:35),
+                        # каждую секунду повторяя "TP1 исполнился частично (0.785100 из
+                        # 0.785137)" -> _partial_close с remaining_tp1=0.000037 ->
+                        # PaperClient.validate_order бросает "base amount must be
+                        # positive, got 0.0" (0.000037 округляется в 0 по
+                        # market.size_decimals) -> filled_now=0 -> remaining_tp1 не
+                        # меняется -> следующий тик та же ошибка, и так до бесконечности
+                        # (пока позицию не закроет что-то ДРУГОЕ - стоп/dominance/
+                        # time_exit). Ровно та же "пыльная хвостовая" проблема, что уже
+                        # решена в _enter_with_chase (см. tick/round там) - там она
+                        # обрабатывается, тут нет. Добавляем тот же tick-порог.
+                        tick = 10 ** (-pos.market.size_decimals)
+                        is_dust = remaining_tp1 <= 1e-9 or round(remaining_tp1, pos.market.size_decimals) < tick
+                        if is_dust:
+                            # WEAKENING уже закрыл не меньше, чем предполагал план TP1
+                            # (или остаток - "пыль", которую биржа всё равно не примет) -
+                            # по факту план TP1 считаем выполненным остатком позиции.
                             pos.tp1_done = True
                             pos.trailing_active = True
                             pos.trailing_extreme = price
-                            log.info("[%s] TP1 пропущен (WEAKENING уже закрыл достаточно) - "
-                                      "остаток переведён на трейлинг-стоп %.2f%%",
-                                      pos.symbol, pos.plan.trailing_stop_pct)
+                            log.info("[%s] TP1 пропущен (WEAKENING уже закрыл достаточно, либо остаток "
+                                      "%.8f - пыль ниже размера лота) - остаток переведён на трейлинг-стоп %.2f%%",
+                                      pos.symbol, remaining_tp1, pos.plan.trailing_stop_pct)
                         else:
                             filled_now = await self._partial_close(pos, snap, remaining_tp1, "tp1")
                             pos.tp1_filled += filled_now
