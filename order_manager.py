@@ -698,10 +698,13 @@ class OrderManager:
         blocking_walls = snap.ask_walls if pos.side == "long" else snap.bid_walls
         holding_walls = snap.bid_walls if pos.side == "long" else snap.ask_walls
         dominance_now = False
+        blocking_usd_now = 0.0
+        holding_usd = 0.0
         if blocking_walls:
             nearest_blocking = min(blocking_walls, key=lambda w: w.distance_pct)
             nearest_holding = min(holding_walls, key=lambda w: w.distance_pct) if holding_walls else None
             holding_usd = nearest_holding.usd if nearest_holding else 0.0
+            blocking_usd_now = nearest_blocking.usd
             opposing_is_real_wall = nearest_blocking.usd >= CFG.wall_min_usd
             opposing_at_least_holding = nearest_blocking.usd >= holding_usd
             dominance_now = opposing_is_real_wall and opposing_at_least_holding
@@ -709,11 +712,29 @@ class OrderManager:
         # (не общий invalidation_streak) - см. комментарий у
         # pos.wall_dominance_streak. Разовое дёрганье стенки на 1 тик больше
         # не хлопает structure_invalidated само по себе.
+        #
+        # Логируем ТОЛЬКО переходы состояния (старт/сброс/срабатывание серии),
+        # а не каждый тик - иначе спам в логах при position_check_interval_sec=1s.
+        # Добавлено 19.08 - раньше не было видно ПОЧЕМУ конкретная сделка
+        # держалась N секунд (пользователь спрашивал про размеры стенок в
+        # моменте, а в логах их не было вообще, приходилось гадать по
+        # косвенным WALL_CANDIDATE/WALL_OUTCOME). Теперь видно держащая/
+        # встречная в USD на каждой смене состояния серии.
         if dominance_now:
+            if pos.wall_dominance_streak == 0:
+                log.info("[%s] dominance: серия началась (держащая=%.0f встречная=%.0f, нужно %d "
+                          "тиков подряд)", pos.symbol, holding_usd, blocking_usd_now,
+                          CFG.wall_dominance_confirm_ticks)
             pos.wall_dominance_streak += 1
         else:
+            if pos.wall_dominance_streak > 0:
+                log.info("[%s] dominance: серия сброшена на %d/%d тиках (держащая=%.0f встречная=%.0f)",
+                          pos.symbol, pos.wall_dominance_streak, CFG.wall_dominance_confirm_ticks,
+                          holding_usd, blocking_usd_now)
             pos.wall_dominance_streak = 0
         if pos.wall_dominance_streak >= CFG.wall_dominance_confirm_ticks:
+            log.info("[%s] dominance: ПОДТВЕРЖДЕНО %d тиков подряд (держащая=%.0f встречная=%.0f) - "
+                      "закрываем", pos.symbol, pos.wall_dominance_streak, holding_usd, blocking_usd_now)
             return True
 
         if pos.signal_type == "absorption":
