@@ -69,6 +69,19 @@ class BookSnapshot:
     bid_volume_near: float
     ask_volume_near: float
     imbalance: float  # 0..1, доля бидов в объёме bid+ask вблизи мида
+    # Крупнейшая ОТДЕЛЬНАЯ заявка (один уровень книги, не сумма) на каждой
+    # стороне в пределах wall_max_distance_pct от mid - независимо от
+    # wall_min_usd (bid_walls/ask_walls ниже уже отфильтрованы этим порогом
+    # и годятся только для "стенки, которая точно квалифицируется", а не для
+    # СРАВНЕНИЯ сторон - встречная сторона в реальном примере пользователя
+    # может быть меньше порога, но всё равно нужна для wall advantage ratio).
+    # Добавлено 21.08 (полная перестройка торговой логики на механику
+    # ORDER BOOK -> EDGE -> ENTRY, см. signals.py). 0.0/0.0, если на этой
+    # стороне вообще нет уровней в пределах диапазона.
+    bid_top_price: float = 0.0
+    bid_top_usd: float = 0.0
+    ask_top_price: float = 0.0
+    ask_top_usd: float = 0.0
     # Microprice - "справедливая" цена, взвешенная размером противоположной
     # стороны топа стакана: (best_bid*ask_size + best_ask*bid_size) / (ask_size+bid_size).
     # Добавлено 19.08 (финальный этап рестройки стратегии) по прямому запросу
@@ -137,12 +150,17 @@ def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tupl
     bid_walls = find_walls(bids, "bid")
     ask_walls = find_walls(asks, "ask")
 
-    near_bids = [price * size for price, size in bids if abs(price - mid) / mid <= max_dist]
-    near_asks = [price * size for price, size in asks if abs(price - mid) / mid <= max_dist]
-    bid_vol = sum(near_bids)
-    ask_vol = sum(near_asks)
+    near_bid_levels = [(price, price * size) for price, size in bids if abs(price - mid) / mid <= max_dist]
+    near_ask_levels = [(price, price * size) for price, size in asks if abs(price - mid) / mid <= max_dist]
+    bid_vol = sum(usd for _, usd in near_bid_levels)
+    ask_vol = sum(usd for _, usd in near_ask_levels)
     total = bid_vol + ask_vol
     imbalance = (bid_vol / total) if total > 0 else 0.5
+
+    # Крупнейшая ОТДЕЛЬНАЯ заявка на каждой стороне - см. докстринг
+    # BookSnapshot.bid_top_usd/ask_top_usd выше.
+    bid_top_price, bid_top_usd = max(near_bid_levels, key=lambda pu: pu[1], default=(0.0, 0.0))
+    ask_top_price, ask_top_usd = max(near_ask_levels, key=lambda pu: pu[1], default=(0.0, 0.0))
 
     return BookSnapshot(
         market_id=str(market_id),
@@ -155,6 +173,10 @@ def analyze_book(symbol: str, market_id: str, bids: List[tuple], asks: List[tupl
         bid_volume_near=bid_vol,
         ask_volume_near=ask_vol,
         imbalance=imbalance,
+        bid_top_price=bid_top_price,
+        bid_top_usd=bid_top_usd,
+        ask_top_price=ask_top_price,
+        ask_top_usd=ask_top_usd,
         microprice=microprice,
     )
 
@@ -190,7 +212,7 @@ class MarketData:
         bids = [(float(o["price"]), float(o["size"])) for o in book.get("bids", [])]
         asks = [(float(o["price"]), float(o["size"])) for o in book.get("asks", [])]
         return analyze_book(market.symbol, str(market.market_index), bids, asks,
-                             CFG.wall_min_usd, CFG.wall_max_distance_pct, CFG.wall_backup_range_pct)
+                             CFG.wall_min_usd, CFG.wall_max_distance_pct)
 
     # ------------------------------------------------------------------ #
 
