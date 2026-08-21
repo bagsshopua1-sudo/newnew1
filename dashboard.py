@@ -79,7 +79,7 @@ class Dashboard:
             positions.append({
                 "symbol": sym, "side": pos.side, "size": round(pos.filled_size, 6),
                 "avg_entry": round(pos.avg_entry, 4), "sl": round(pos.current_sl_price, 4),
-                "tp1_done": pos.tp1_done, "trailing": pos.trailing_active,
+                "reduced": pos.reduced_once, "edge_reverse_streak": pos.edge_reverse_streak,
                 "opened_at": pos.opened_at, "signal_type": pos.signal_type,
             })
         return {
@@ -388,12 +388,12 @@ async function refresh() {
 
   const pb = document.getElementById('positionsBox');
   pb.innerHTML = s.positions.length === 0 ? '<div class="empty">нет открытых позиций</div>' :
-    `<table><tr><th>Символ</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>Стоп</th><th>TP1</th><th>Трейлинг</th><th>Открыта</th></tr>` +
+    `<table><tr><th>Символ</th><th>Сторона</th><th>Размер</th><th>Вход</th><th>SL (бэкстоп)</th><th>REDUCE</th><th>Разворот EDGE</th><th>Открыта</th></tr>` +
     s.positions.map(p => `<tr>
       <td>${p.symbol}</td>
       <td><span class="badge ${p.side}">${p.side.toUpperCase()}</span></td>
       <td>${fmt(p.size,6)}</td><td>${fmt(p.avg_entry,4)}</td><td>${fmt(p.sl,4)}</td>
-      <td>${p.tp1_done ? '✅' : '—'}</td><td>${p.trailing ? '🔄' : '—'}</td>
+      <td>${p.reduced ? '✅' : '—'}</td><td>${p.edge_reverse_streak > 0 ? p.edge_reverse_streak : '—'}</td>
       <td>${p.opened_at ? timeAgo(Math.max(0, s.server_ts - p.opened_at)) + ' назад' : '—'}</td>
     </tr>`).join('') + `</table>`;
 
