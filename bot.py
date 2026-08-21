@@ -2,10 +2,20 @@
 Точка входа бота.
 
 MODE=collect -> запускает только сборщик стакана (см. collector.py), торговли нет.
-MODE=paper   -> полный цикл (сигналы + вход лимитками с chase + SL/TP + трейлинг +
-                трендовый фильтр + kill switch + журнал сделок + веб-дашборд),
+MODE=paper   -> полный цикл (EDGE-сигналы + вход лимитками с chase/reprice/cancel +
+                постоянный пересчёт EDGE на позиции (CLOSE/REDUCE/HOLD) + жёсткий
+                SL как аварийный бэкстоп + kill switch + журнал сделок + веб-дашборд),
                 но ордера виртуальные, через lighter.PaperClient на реальном стакане.
 MODE=live    -> то же самое, но реальными деньгами через lighter.SignerClient.
+
+ПЕРЕСТРОЕНО 21.08 по прямому запросу пользователя вместе с остальной торговой
+логикой (см. config.py/signals.py/order_manager.py). Убраны: BinanceTradeFeed
+(тейп исполненных сделок - новой механике не нужен, EDGE считается только по
+displayed-размеру заявок в стакане), TrendFilter (трендовый фильтр входа) и
+WallEventLog (журнал WALL_CANDIDATE/WALL_OUTCOME старой классификации) -
+всё это было частью прежней, более сложной системы (REAL_WALL/ABSORPTION/
+BREAKOUT/SPOOF), которую пользователь прямо попросил заменить одной простой
+механикой ORDER BOOK -> EDGE -> ENTRY -> REPRICE/CANCEL -> HOLD/REDUCE -> EXIT.
 
 Запуск:
     python bot.py
@@ -19,7 +29,6 @@ import time
 from typing import Dict
 
 from binance_feed import BinanceFeed
-from binance_trades import BinanceTradeFeed
 from config import CFG
 from dashboard import Dashboard
 from exchange_client import ExchangeClient
@@ -29,8 +38,6 @@ from order_manager import OrderManager
 from risk import RiskManager
 from signals import SignalEngine
 from trade_log import TradeLog
-from trend_filter import TrendFilter
-from wall_event_log import WallEventLog
 
 log = logging.getLogger("bot")
 
@@ -40,49 +47,27 @@ async def run_trading():
     markets = await exchange.resolve_markets()
 
     trade_log = TradeLog()
-    # Персистентное хранилище WALL_CANDIDATE/WALL_OUTCOME/shadow_evals (аудит
-    # стратегии 18.08, этап 1.3) - см. wall_event_log.py.
-    wall_events = WallEventLog()
     kill_switch = KillSwitch()
     risk = RiskManager(on_breach=kill_switch.trigger)
 
     md = MarketData(exchange, markets, on_prolonged_outage=kill_switch.trigger)
 
-    # Поток реальных исполненных сделок (aggTrade) - отдельно от снепшотов
-    # стакана, нужен для "сколько реально прошло объёма у этой стенки", а не
-    # только "какой displayed size сейчас видно" (см. binance_trades.py).
-    # Теперь передаётся и в OrderManager (см. ниже) - opposite-flow exit
-    # (19.08, финальный этап рестройки) смотрит на тот же реальный тейп уже
-    # ПОСЛЕ входа, чтобы поймать разворот потока против позиции раньше, чем
-    # он успеет сломать формальную структуру сделки.
-    # ВАЖНО (19.08, второй раунд диагностики "ни одной сделки не открылось"):
-    # BinanceTradeFeed больше НЕ открывает своё отдельное WS-соединение (это
-    # и было причиной бага - второе одновременное соединение к Binance с
-    # одного и того же уже помеченного/rate-limited IP Render молча не
-    # получало данных). Теперь это пассивное хранилище, которое наполняет
-    # ЕДИНОЕ соединение BinanceFeed (см. binance_feed.py) - поэтому создаём
-    # его первым и передаём в BinanceFeed как trade_feed.
-    binance_trades = BinanceTradeFeed(markets) if CFG.use_binance_signals else None
-    binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger, trade_feed=binance_trades) \
-        if CFG.use_binance_signals else None
+    # Источник сигнала - глубокий стакан Binance Futures (публичный WS, без
+    # ключей, см. binance_feed.py) - монитор ORDER BOOK -> EDGE. Исполнение
+    # всё равно на Lighter (см. order_manager.py). Если USE_BINANCE_SIGNALS=false -
+    # сигналы и исполнение оба идут по стакану Lighter.
+    binance = BinanceFeed(markets, on_prolonged_outage=kill_switch.trigger) if CFG.use_binance_signals else None
 
-    orders = OrderManager(exchange, md, risk, trade_log=trade_log, kill_switch=kill_switch,
-                           trade_feed=binance_trades)
+    orders = OrderManager(exchange, md, risk, trade_log=trade_log, kill_switch=kill_switch)
     kill_switch.bind(orders)
 
-    trend_filters = {sym: TrendFilter(CFG.trend_ema_fast_sec, CFG.trend_ema_slow_sec,
-                                       CFG.vol_lookback, CFG.vol_spike_mult,
-                                       CFG.dead_range_lookback_sec, CFG.dead_range_min_pct,
-                                       CFG.dead_range_min_coverage_sec) for sym in markets}
-    engines = {sym: SignalEngine(sym, trend_filter=trend_filters[sym], trade_feed=binance_trades,
-                                  event_log=wall_events)
-               for sym in markets}
+    engines = {sym: SignalEngine(sym) for sym in markets}
 
     latest_lighter_snap: Dict[str, "BookSnapshot"] = {}
     # См. CFG.startup_grace_sec - первые N секунд после запуска процесса сигналы
-    # не обрабатываем вообще (ни на вход, ни на разворот) - стакан/wall-tracking
-    # ещё не устаканились после свежего WS-коннекта, особенно после free-tier
-    # рестарта Render (см. комментарий у startup_grace_sec в config.py).
+    # не обрабатываем вообще (ни на вход, ни на разворот) - стакан ещё не
+    # устаканился после свежего WS-коннекта, особенно после free-tier рестарта
+    # Render (см. комментарий у startup_grace_sec в config.py).
     process_start_ts = time.time()
     _startup_grace_logged = False
 
@@ -113,9 +98,10 @@ async def run_trading():
     async def binance_consumer():
         while True:
             snap = await binance.events.get()
-            # Сохраняем последний снепшот стакана Binance - это структура (стенки/
-            # дисбаланс), по которой order_manager._thesis_invalidated проверяет,
-            # жив ли ещё тезис сделки, пока позиция открыта (см. note_signal_snapshot).
+            # Сохраняем последний снепшот стакана Binance - это структура
+            # (крупнейшие заявки на каждой стороне), по которой
+            # order_manager._watch_position постоянно пересчитывает EDGE, пока
+            # позиция открыта (см. note_signal_snapshot).
             orders.note_signal_snapshot(snap)
             lighter_snap = latest_lighter_snap.get(snap.symbol)
             if lighter_snap is None:
@@ -124,22 +110,20 @@ async def run_trading():
 
     async def _maybe_signal(signal_snap, lighter_snap):
         """signal_snap - откуда берём сигнал (Binance или Lighter), lighter_snap -
-        актуальная цена Lighter, по которой реально будем входить/считать SL/TP."""
+        актуальная цена Lighter, по которой реально будем входить/считать SL."""
         if kill_switch.active:
             return  # аварийная остановка: сигналы не обрабатываем, дашборд продолжает работать
 
         engine = engines[signal_snap.symbol]
         signal = engine.on_snapshot(signal_snap)
         if signal is None:
-            return
+            return  # NO TRADE - явного EDGE сейчас нет, ничего не делаем
 
         # См. CFG.startup_grace_sec - первые секунды после запуска процесса
-        # сигналы НЕ отбрасываем молча в on_snapshot (там wall-tracking должен
-        # продолжать копиться и прогреваться нормально), а глушим именно тут,
-        # на выходе - чтобы не открывать сделки на ещё не устаканившемся стакане
-        # сразу после (пере)запуска процесса. on_snapshot() выше всё равно
-        # выполняется каждый тик ради прогрева self.tracked - иначе к моменту
-        # окончания грейс-периода стенки пришлось бы отслеживать заново с нуля.
+        # сигналы НЕ отбрасываем молча в on_snapshot (там подтверждения EDGE
+        # должны продолжать копиться нормально), а глушим именно тут, на
+        # выходе - чтобы не открывать сделки на ещё не устаканившемся стакане
+        # сразу после (пере)запуска процесса.
         nonlocal _startup_grace_logged
         since_start = time.time() - process_start_ts
         if since_start < CFG.startup_grace_sec:
@@ -150,43 +134,28 @@ async def run_trading():
                 _startup_grace_logged = True
             return
 
-        log.info("[%s] СИГНАЛ %s (%s) confidence=%.2f у цены %.2f (источник: %s)",
-                  signal.symbol, signal.side.upper(), signal.signal_type, signal.confidence,
-                  signal.reference_price, "Binance" if binance else "Lighter")
+        log.info("[%s] СИГНАЛ %s (%s) у цены %.2f favor=%.0f oppose=%.0f ratio=%.2f (источник: %s)",
+                  signal.symbol, signal.side.upper(), signal.signal_type, signal.reference_price,
+                  signal.wall_usd, signal.opposing_usd, signal.ratio, "Binance" if binance else "Lighter")
 
-        if signal.confidence < 0.5:
-            return  # слабый сигнал без подтверждения имбалансом/трендом - пропускаем
-
-        # Латентность: сколько времени прошло между событием стакана, которое
-        # породило сигнал, и тем, что бот его обработал - важно на free tier
+        # Латентность: сколько времени прошло между снепшотом стакана, который
+        # породил сигнал, и тем, что бот его обработал - важно на free tier
         # (Frankfurt), где сеть/CPU не гарантированы. Если сигналу уже условно
-        # 300+ мс, к моменту реального входа он может успеть "протухнуть".
+        # 300+ мс, к моменту реального входа он может успеть "протухнуть", т.е.
+        # структура (стенка), на которой строился сигнал, могла уже измениться -
+        # прямое требование пользователя "не открывать позицию, если signal уже
+        # исчез".
         signal_age_ms = (time.time() - signal_snap.ts) * 1000
         basis_pct = abs(lighter_snap.mid - signal_snap.mid) / lighter_snap.mid * 100 if binance else 0.0
         log.info("[%s] latency signal_age_ms=%.0f basis_pct=%.4f", signal.symbol, signal_age_ms, basis_pct)
 
-        # НОВОЕ 19.08 (финальный этап рестройки стратегии) - прямой пункт из
-        # запроса пользователя: "если сигнал устарел к моменту исполнения на
-        # Lighter - отменить вход". Раньше signal_age_ms только логировался и
-        # ни на что не влиял (см. CFG.max_signal_age_ms в config.py за полное
-        # обоснование порога) - структура (стенка/уровень), на которой строился
-        # сигнал, могла успеть измениться за время задержки между снепшотом
-        # Binance и обработкой ботом, особенно на free tier (Frankfurt, не
-        # гарантированы CPU/сеть).
         if signal_age_ms > CFG.max_signal_age_ms:
-            log.info("[%s] сигнал %s (%s) ОТМЕНЁН: устарел к моменту исполнения "
-                      "(signal_age_ms=%.0f > %.0f)", signal.symbol, signal.side.upper(),
-                      signal.signal_type, signal_age_ms, CFG.max_signal_age_ms)
+            log.info("[%s] сигнал %s ОТМЕНЁН: устарел к моменту исполнения (signal_age_ms=%.0f > %.0f)",
+                      signal.symbol, signal.side.upper(), signal_age_ms, CFG.max_signal_age_ms)
             return
 
         if binance:
-            # Порог на разрыв цен Lighter/Binance (BASIS_MAX_DIVERGENCE_PCT) убран
-            # по просьбе пользователя 19.08 - раньше он резал сигналы просто за то,
-            # что биржи разошлись в моменте, хотя расчёт стопа теперь сам поправлен
-            # на этот базис (см. Signal.exchange_basis / risk.build_plan) и уже не
-            # тянет туда межбиржевой шум как ложную "структуру". basis_pct всё ещё
-            # считается и логируется выше - просто больше не блокирует вход.
-            # цену/стоп/тейк считаем от РЕАЛЬНОЙ цены исполнения (Lighter), не от Binance
+            # цену/стоп считаем от РЕАЛЬНОЙ цены исполнения (Lighter), не от Binance
             signal.mid = lighter_snap.mid
             # См. Signal.exchange_basis в signals.py - risk.build_plan скорректирует
             # reference_price (стенка, Binance) на этот базис перед расчётом
@@ -252,7 +221,6 @@ async def run_trading():
             await binance.stop()
         await exchange.close()
         trade_log.close()
-        wall_events.close()
 
 
 async def main():
