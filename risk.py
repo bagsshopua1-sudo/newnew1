@@ -93,13 +93,27 @@ class RiskManager:
 
     def build_plan(self, symbol: str, side: str, entry_price: float,
                     wall_price: Optional[float] = None, wall_usd: float = 0.0,
-                    backup_usd: float = 0.0) -> TradePlan:
+                    backup_usd: float = 0.0, exchange_basis: float = 0.0) -> TradePlan:
         """
         wall_price - цена стенки/уровня, который породил сигнал (Signal.reference_price).
         Стоп считается от неё (+ буфер), а не фиксированным % - расстояние диктует
         реальная структура рынка на момент сигнала, а не одно и то же число для
         каждой сделки. Зажимаем в [MIN_STOP_PCT, MAX_STOP_PCT], чтобы не получить
         ни слишком узкий стоп (шум выбьет), ни неоправданно широкий.
+
+        exchange_basis - Signal.exchange_basis (lighter_mid - binance_mid на момент
+        сигнала). wall_price приходит с Binance, а entry_price - реальная цена
+        исполнения на Lighter, поэтому их сырая разница включает в себя не только
+        структурное расстояние до стенки, но и весь межбиржевой базис (обсуждение
+        с пользователем 19.08: стенка 68000 на Binance, вход по 68300 на Lighter
+        из-за базиса в 300$ - "стоп" 300$ на самом деле не про уровень в стакане,
+        это разница цен между биржами). Сдвигаем wall_price на тот же базис перед
+        расчётом дистанции - тогда сравниваем entry и wall в одном "ценовом
+        пространстве" (оба как бы на Lighter), и базис из raw_distance уходит:
+        raw_distance = |entry_price - (wall_price + exchange_basis)|
+                     = |(entry_price - exchange_basis) - wall_price|
+        то есть по сути "цена входа, приведённая обратно к Binance" минус "цена
+        стенки на Binance" - чистое структурное расстояние без шума с чужой биржи.
 
         wall_usd/backup_usd - размер стенки и подложки за ней (Signal.wall_usd/
         backup_usd, см. signals.py). ПОПРОБОВАЛИ 18.08 масштабировать дистанцию
@@ -118,7 +132,8 @@ class RiskManager:
         Если захотим вернуться к этой идее - она тут, просто закомментирована.
         """
         if wall_price:
-            raw_distance = abs(entry_price - wall_price) + entry_price * CFG.stop_buffer_pct / 100
+            adjusted_wall_price = wall_price + exchange_basis
+            raw_distance = abs(entry_price - adjusted_wall_price) + entry_price * CFG.stop_buffer_pct / 100
         else:
             raw_distance = entry_price * CFG.stop_loss_pct / 100  # запасной вариант
 
